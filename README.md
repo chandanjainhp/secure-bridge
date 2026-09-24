@@ -1,149 +1,225 @@
-# Secure Bridge
+<div align="center">
 
-Secure Bridge is a hybrid web application that provides an encrypted messaging and chat environment. The backend manages third-party LLM API keys via a secure **Bring Your Own Key (BYOK)** model, tracks API usage, supports Model Context Protocol (MCP) integrations, and leverages Fully Homomorphic Encryption (FHE) with OpenFHE compiled to WebAssembly for confidential data processing.
+# 🔐 Secure Bridge
 
-The project consists of:
-1. **React + Vite Frontend (`client/`)** using Tailwind CSS, shadcn/ui, and React Query.
-2. **Node.js + Express Backend (`server/`)** using MongoDB for primary storage, Redis for OTP caching/rate limiting, and JSON Web Token (JWT) credentials.
-3. **C++ OpenFHE & Emscripten Build Setup (`server/emsdk/`, `server/fhe/`)** for compiling homomorphic encryption logic to WASM/JS wrappers.
-4. **MCP Server (`server/mcp-server/`)** - A FastMCP Python server that provides context tools for AI models via streamable-HTTP transport.
+**Encrypted AI messaging with Bring Your Own Key (BYOK), MCP integrations, and Fully Homomorphic Encryption (FHE) via WebAssembly.**
 
----
 
-## Table of Contents
 
-- [Project Architecture & Directory Structure](#project-architecture--directory-structure)
-- [Key Features](#key-features)
-- [Prerequisites](#prerequisites)
-- [Environment Configuration](#environment-configuration)
-- [Database & Services Setup (Docker)](#database--services-setup-docker)
-- [Running the Project Locally](#running-the-project-locally)
-  - [Start Backend](#start-backend)
-  - [Start Frontend](#start-frontend)
-- [Homomorphic Encryption (FHE) WebAssembly Build](#homomorphic-encryption-fhe-webassembly-build)
-- [Model Context Protocol (MCP) Features](#model-context-protocol-mcp-features)
-  - [MCP Server Setup](#mcp-server-setup)
-  - [MCP Configuration](#mcp-configuration)
-- [Chat Encryption](#chat-encryption)
-- [Testing & Code Quality](#testing--code-quality)
-- [Troubleshooting](#troubleshooting)
+</div>
 
 ---
 
-## Project Architecture & Directory Structure
+## 📖 Overview
 
-Secure Bridge uses a hybrid structure that combines a traditional layered architecture with domain-specific feature folders (`client/src/features` and `server/src/features`) to isolate core BYOK and usage features:
+Secure Bridge is a hybrid web application that provides an encrypted messaging and chat environment. The backend manages third-party LLM API keys through a secure **Bring Your Own Key (BYOK)** model, tracks API usage, supports **Model Context Protocol (MCP)** integrations, and uses **Fully Homomorphic Encryption (FHE)** with OpenFHE compiled to WebAssembly for confidential data processing.
 
-```
+### Components
+
+| # | Component | Location | Stack |
+|---|-----------|----------|-------|
+| 1 | **Frontend** | `client/` | React + Vite, Tailwind CSS, shadcn/ui, React Query |
+| 2 | **Backend API** | `server/` | Node.js + Express, MongoDB, Redis, JWT |
+| 3 | **FHE / WASM build** | `server/emsdk/`, `server/fhe/` | C++ OpenFHE, Emscripten |
+| 4 | **MCP Server** | `server/mcp-server/` | FastMCP (Python), streamable-HTTP transport |
+
+---
+
+## 📑 Table of Contents
+
+- [Key Features](#-key-features)
+- [Project Structure](#-project-structure)
+- [Prerequisites](#-prerequisites)
+- [Quick Start](#-quick-start)
+- [Environment Configuration](#-environment-configuration)
+- [Homomorphic Encryption (FHE)](#-homomorphic-encryption-fhe)
+- [Model Context Protocol (MCP)](#-model-context-protocol-mcp)
+- [Chat Encryption](#-chat-encryption)
+- [Testing & Code Quality](#-testing--code-quality)
+- [Troubleshooting](#-troubleshooting)
+
+---
+
+## ✨ Key Features
+
+| Feature | Description |
+|---------|-------------|
+| 🔑 **Authentication** | JWT-based sessions with optional OTP verification sent via Gmail SMTP. |
+| 🗂️ **Project Workspaces** | Organization-level workspaces with separate system prompts, settings, and conversation history. |
+| 🛡️ **BYOK Key Caching** | Third-party keys (OpenAI, Anthropic, Gemini, Azure) encrypted at rest with AES-256-GCM. Plaintext keys are never exposed in responses or logs. |
+| 📊 **Usage Tracking** | Free tiers with strict limits enforced by middleware; usage cached in MongoDB/Redis. |
+| 🧮 **Experimental OpenFHE** | BFV-scheme FHE via C++ wrappers compiled to WebAssembly, with a JavaScript `FHEStub.js` fallback in mock mode. |
+| 🔌 **MCP Integration** | AI models can use context tools (external calls, diagnostics) through a dedicated FastMCP Python server. |
+| 💬 **Chat Encryption** | End-to-end AES-256-GCM message encryption, plus optional FHE-based homomorphic scoring for context selection. |
+
+---
+
+## 🗺️ Project Structure
+
+Secure Bridge combines a layered architecture with domain-specific feature folders (`client/src/features`, `server/src/features`) to isolate the core BYOK and usage features.
+
+```text
 Secure-Bridge/
-├── client/                     # Frontend Application (React + Vite)
-│   ├── public/                 # Static public assets
-│   ├── src/                    # Source Code
+├── client/                     # Frontend (React + Vite)
+│   ├── public/                 # Static assets
+│   ├── src/
 │   │   ├── app/                # Global config (store, router, ErrorBoundary)
 │   │   ├── features/           # Modular features
-│   │   │   ├── api-key/        # BYOK management components
-│   │   │   ├── auth/           # Login, registration, & OTP auth state/components
-│   │   │   ├── chat/           # Conversational messaging interface
-│   │   │   ├── layout/         # Persistent sidebars & panels
-│   │   │   ├── profile/        # User profile configuration
-│   │   │   ├── projects/       # Workspaces/Projects CRUD
-│   │   │   └── usage/          # API usage visual graphs & limits
-│   │   ├── pages/              # Page views matching routing paths
-│   │   ├── shared/             # Global components, hooks, & API client
-│   │   └── test/               # UI components test suites
-│   ├── vite.config.js          # Vite build config
-│   ├── tailwind.config.js      # Tailwind CSS configuration
-│   └── package.json            # Frontend package details
-├── server/                     # Backend API Server (Express.js)
-│   ├── src/                    # Backend Source Code
-│   │   ├── config/             # Connection configurations (Redis, etc.)
-│   │   ├── controllers/        # General controller classes
-│   │   ├── db/                 # Database initialization and connection (Mongoose)
-│   │   ├── email/              # Email templates & transport setups
-│   │   ├── features/           # Feature-based backend logic (api-key, chat, usage)
-│   │   ├── middlewares/        # Security headers, auth verification, validation
-│   │   ├── models/             # Mongoose database models (User, Project, apikey)
-│   │   ├── routes/             # App Router registers (Users, Auth, Project, apiKey)
-│   │   ├── services/           # Encryption services, FHE Stub, OpenFHE, MCP client
-│   │   ├── tests/              # Jest integration/unit test suite
-│   │   ├── utils/              # Response/Error helpers (ApiError, asyncHandler)
-│   │   └── validation/         # Request input validation rules
-│   ├── mcp-server/             # MCP Server (FastMCP Python) - provides context tools
-│   │   ├── src/                # MCP server source code
-│   │   │   ├── tools/          # MCP tool implementations (fetch_url, search_project_context)
-│   │   │   └── tests/          # MCP server unit and integration tests
-│   │   └── README.md           # MCP server documentation
-│   ├── emsdk/                  # Emscripten toolchain for WebAssembly compiling
-│   ├── fhe/                    # Precompiled FHE compiled binaries & scripts
-│   ├── fhe-wasm/               # Precompiled FHE WASM artifacts
-│   ├── openfhe-development/    # C++ OpenFHE source folder
-│   └── package.json            # Backend package details
-├── scripts/                    # Script helpers for dev setup
-│   ├── db-up.sh                # Script to start MongoDB container
-│   └── db-down.sh              # Script to tear down databases
-├── docker-compose.yml          # Container configuration for MongoDB & Redis
-└── README.md                   # Main Project Documentation
+│   │   │   ├── api-key/        #   BYOK management
+│   │   │   ├── auth/           #   Login, registration, OTP
+│   │   │   ├── chat/           #   Conversational interface
+│   │   │   ├── layout/         #   Sidebars & panels
+│   │   │   ├── profile/        #   User profile settings
+│   │   │   ├── projects/       #   Workspaces / Projects CRUD
+│   │   │   └── usage/          #   Usage graphs & limits
+│   │   ├── pages/              # Route-level page views
+│   │   ├── shared/             # Global components, hooks, API client
+│   │   └── test/               # UI test suites
+│   ├── vite.config.js
+│   ├── tailwind.config.js
+│   └── package.json
+│
+├── server/                     # Backend API (Express.js)
+│   ├── src/
+│   │   ├── config/             # Redis & other connection configs
+│   │   ├── controllers/        # General controllers
+│   │   ├── db/                 # Mongoose initialization & connection
+│   │   ├── email/              # Templates & transport setup
+│   │   ├── features/           # Feature logic (api-key, chat, usage)
+│   │   ├── middlewares/        # Security headers, auth, validation
+│   │   ├── models/             # Mongoose models (User, Project, apikey)
+│   │   ├── routes/             # Users, Auth, Project, apiKey routes
+│   │   ├── services/           # Encryption, FHE stub, OpenFHE, MCP client
+│   │   ├── tests/              # Jest integration/unit tests
+│   │   ├── utils/              # ApiError, asyncHandler, helpers
+│   │   └── validation/         # Request validation rules
+│   ├── mcp-server/             # FastMCP Python server (context tools)
+│   │   ├── src/
+│   │   │   ├── tools/          #   fetch_url, search_project_context
+│   │   │   └── tests/          #   Unit & integration tests
+│   │   └── README.md
+│   ├── emsdk/                  # Emscripten toolchain (WASM builds)
+│   ├── fhe/                    # Compiled FHE binaries & scripts
+│   ├── fhe-wasm/               # Compiled FHE WASM artifacts
+│   ├── openfhe-development/    # C++ OpenFHE source
+│   └── package.json
+│
+├── scripts/
+│   ├── db-up.sh                # Start MongoDB container
+│   └── db-down.sh              # Tear down databases
+├── docker-compose.yml          # MongoDB & Redis containers
+└── README.md
 ```
 
 ---
 
-## Key Features
+## 🧰 Prerequisites
 
-1. **Authentication**: JWT-based session security with optional One-Time Password (OTP) verification sent via Gmail SMTP.
-2. **Project-based Workspaces**: Organization-level workspaces allowing different system prompts, settings, and conversation history.
-3. **BYOK API-Key Caching**: Secure caching of third-party keys (OpenAI, Anthropic, Gemini, Azure) encrypted at rest using AES-256-GCM. Plaintext keys are never revealed in responses or logs.
-4. **Token & Message Usage Tracking**: Free tiers with strict limits enforced by middleware, caching usage records in MongoDB/Redis.
-5. **Experimental OpenFHE Support**: Fully Homomorphic Encryption (FHE) support utilizing C++ wrappers compiled to WebAssembly (fallback to a javascript `FHEStub.js` in mock environment). Supports BFV scheme with configurable encryption modes.
-6. **Model Context Protocol (MCP)**: Server integrations allowing AI models to leverage context tools (e.g. executing external calls and system diagnostics). Includes a dedicated FastMCP Python server with tools for URL fetching and project context search.
-7. **Chat Encryption**: End-to-end encryption for chat messages with AES-256-GCM, with optional FHE-based homomorphic scoring for context selection.
-
----
-
-## Prerequisites
-
-- **Node.js**: `20.x` or later recommended
-- **Bun**: `1.3.x` or later (used primarily for client dependencies and Vite tooling)
-- **Docker & Docker Compose**: Needed to run database services locally
-- **Python 3.10+**: Required for MCP Server (FastMCP)
-- **pip**: Required to install MCP Server dependencies
+| Tool | Version | Used for |
+|------|---------|----------|
+| **Node.js** | `20.x` or later | Backend and tooling |
+| **Bun** | `1.3.x` or later | Client dependencies and Vite tooling |
+| **Docker & Docker Compose** | Latest | Local database services |
+| **Python** | `3.10+` | MCP server (FastMCP) |
+| **pip** | Latest | Installing MCP server dependencies |
 
 ---
 
-## Environment Configuration
+## 🚀 Quick Start
 
-Configure environmental secrets before executing the services.
+### 1. Start database services
 
-### Backend Configurations (`server/.env`)
-Create a `.env` file under `server/` (see `server/.env.docker` or `server/.env.example` as a template):
+```bash
+docker compose up -d mongodb redis
+```
+
+> [!NOTE]
+> Redis is mapped to host port **`6380`** (container port `6379`) to avoid conflicts with native Redis instances.
+
+Verify MongoDB status:
+
+```bash
+./scripts/db-up.sh
+```
+
+<details>
+<summary><b>Optional: Mongo Express dashboard</b></summary>
+
+```bash
+docker compose --profile tools up -d mongo-express
+```
+
+Then open <http://localhost:8081> to browse database collections.
+
+</details>
+
+### 2. Start the backend
+
+```bash
+cd server
+npm install
+npm run db:seed   # optional: seed default collections
+npm run dev
+```
+
+The API runs at <http://localhost:8000>.
+
+### 3. Start the frontend
+
+```bash
+cd client
+npm install
+npm run dev
+```
+
+The app opens at <http://localhost:5173>.
+
+### 4. Shut down services
+
+```bash
+./scripts/db-down.sh
+```
+
+---
+
+## ⚙️ Environment Configuration
+
+Configure environment variables before starting the services.
+
+### Backend — `server/.env`
+
+Create the file using `server/.env.docker` or `server/.env.example` as a template.
+
 ```env
+# ── Server ──────────────────────────────────────────────
 PORT=8000
 NODE_ENV=development
 MONGODB_URI=mongodb://admin:admin123@localhost:27017/Secure-Bridge?authSource=admin
 CORS_ORIGIN=http://localhost:5173
 
-# JWT Credentials
+# ── JWT ─────────────────────────────────────────────────
 JWT_SECRET=replace-with-a-long-random-secret
 JWT_EXPIRES_IN=15m
 JWT_REFRESH_SECRET=replace-with-a-different-long-random-secret
 JWT_REFRESH_EXPIRES_IN=7d
 
-# Cryptography
+# ── Cryptography ────────────────────────────────────────
 ENCRYPTION_KEY=replace-with-a-base64-encoded-32-byte-key
 API_KEY_ENCRYPTION_SECRET=your_api_key_encryption_secret_here
 
-# Redis
+# ── Redis ───────────────────────────────────────────────
 REDIS_URL=redis://localhost:6380
 
-# Nodemailer SMTP Configuration (Gmail)
+# ── Email (Nodemailer / Gmail SMTP) ─────────────────────
 EMAIL_USER=your-email@gmail.com
 EMAIL_PASS=your-app-specific-smtp-password
 
-# FHE Configuration
+# ── FHE ─────────────────────────────────────────────────
 ENCRYPTION_MODE=mock
 FHE_WASM_PATH=
 FHE_JS_PATH=
 
-# MCP (Model Context Protocol) Configuration
+# ── MCP (Model Context Protocol) ────────────────────────
 ENABLE_MCP=false
 OUTBOUND_ALLOWLIST=
 MCP_TRANSPORT=streamable-http
@@ -154,158 +230,115 @@ EXPRESS_API_BASE_URL=http://127.0.0.1:8000
 MCP_SERVICE_TOKEN=change-me-to-a-long-random-hex
 ```
 
-> **Note on ENCRYPTION_MODE**: 
-> - `mock`: Uses FHEStub.js (AES-256-GCM stub, always starts)
-> - `fhe`: Uses real OpenFHE WASM (BFV scheme) with automatic stub fallback if WASM module cannot load
+> [!IMPORTANT]
+> Never commit real secrets. Replace every placeholder value and keep `.env` files out of version control.
 
-> **Note on MCP**: When `ENABLE_MCP=true`, ensure the MCP server is running and `OUTBOUND_ALLOWLIST` is configured with allowed hostnames. Empty allowlist denies all outbound requests (fail-closed).
+**`ENCRYPTION_MODE` values**
 
-### Frontend Configurations (`client/.env`)
-Create a `.env` file under `client/`:
+| Mode | Behavior |
+|------|----------|
+| `mock` | Uses `FHEStub.js` (AES-256-GCM stub). Always starts. |
+| `fhe` | Uses real OpenFHE WASM (BFV scheme), with automatic stub fallback if the WASM module cannot load. |
+
+> [!NOTE]
+> When `ENABLE_MCP=true`, make sure the MCP server is running and `OUTBOUND_ALLOWLIST` lists the allowed hostnames. An empty allowlist denies all outbound requests (fail-closed).
+
+### Frontend — `client/.env`
+
 ```env
 VITE_API_URL=http://localhost:8000/api/v1
 ```
 
 ---
 
-## Database & Services Setup (Docker)
+## 🧮 Homomorphic Encryption (FHE)
 
-We run database components inside isolated Docker containers.
+Secure Bridge supports real OpenFHE-based homomorphic encryption through WebAssembly when `ENCRYPTION_MODE=fhe`.
 
-1. **Start Services**:
-   Start MongoDB and Redis in the background:
-   ```bash
-   docker compose up -d mongodb redis
-   ```
-   *Note: Redis is mapped to host port `6380` (container port `6379`) to avoid conflicts with native instances.*
+### OpenFHE Service
 
-2. **Verify Database Status**:
-   You can verify MongoDB status using the convenience shell script:
-   ```bash
-   ./scripts/db-up.sh
-   ```
+**File:** `server/src/services/OpenFheService.js`
 
-3. **Optional Database Dashboard (Mongo Express)**:
-   Launch the Mongo-Express visual interface:
-   ```bash
-   docker compose --profile tools up -d mongo-express
-   ```
-   Open http://localhost:8081 inside your browser to view the database collections.
+| Property | Value |
+|----------|-------|
+| **Scheme** | BFV (Brakerski/Fan-Vercauteren) |
+| **Ring dimension** | 8192 (supports chat-message-sized inputs) |
+| **Data handling** | UTF-8 bytes packed into BFV slots, with AES-256-GCM at-rest encryption |
+| **Operations** | Homomorphic addition, multiplication, and rotation-based scoring |
 
-4. **Shutdown Services**:
-   ```bash
-   ./scripts/db-down.sh
-   ```
+### FHE Chat Service
 
----
+**File:** `server/src/services/fheChat.js`
 
-## Running the Project Locally
+Provides homomorphic scoring for chat context selection. Messages are encrypted and scored without decrypting their content.
 
-With database services running, boot up the local Node server and Vite client.
+### Rebuilding the WASM artifacts
 
-### Start Backend
+To recompile the C++ OpenFHE source into browser-ready WebAssembly and JavaScript wrappers:
 
-1. Navigate to the server folder and install dependencies:
-   ```bash
-   cd server
-   npm install
-   ```
+1. Set up the Emscripten compiler environment in `server/emsdk/`.
+2. Go to `server/openfhe-development/` and run the build recipe (requires `cmake` and the toolchain).
+3. The build outputs JS glue code and WASM files (e.g. `openfhe_pke_es6.js`, `openfhe_pke_es6.wasm`) into `server/fhe/` and `server/fhe-wasm/`.
+4. Update `FHE_WASM_PATH` and `FHE_JS_PATH` in `server/.env` to point to the new files.
 
-2. Seed default DB collections (Optional):
-   ```bash
-   npm run db:seed
-   ```
-
-3. Boot the Express API Server in development mode:
-   ```bash
-   npm run dev
-   ```
-   The backend server will run on http://localhost:8000.
-
-### Start Frontend
-
-1. Navigate to the client folder and install dependencies:
-   ```bash
-   cd ../client
-   npm install
-   ```
-
-2. Boot the Vite development server:
-   ```bash
-   npm run dev
-   ```
-   Open the client interface in your browser at http://localhost:5173.
+> [!TIP]
+> In mock mode (`ENCRYPTION_MODE=mock`), the backend falls back to `server/src/services/FHEStub.js` without failing startup.
 
 ---
 
-## Homomorphic Encryption (FHE) WebAssembly Build
+## 🔌 Model Context Protocol (MCP)
 
-Secure Bridge supports real OpenFHE-based homomorphic encryption via WebAssembly when `ENCRYPTION_MODE=fhe`. The implementation uses BFV scheme with ring dimension 8192, supporting batch operations over encrypted data.
+Secure Bridge includes a dedicated MCP server (`server/mcp-server/`) built with **FastMCP (Python)** that gives AI models context-aware tools. It communicates with the Express backend over streamable-HTTP transport.
 
-### OpenFHE Service (`server/src/services/OpenFheService.js`)
-- **Scheme**: BFV (Brakerski/Fan-Vercauteren)
-- **Ring Dimension**: 8192 (supports chat-message-sized inputs)
-- **Security**: All text is UTF-8 byte-packed into BFV slots with AES-256-GCM at-rest encryption
-- **Operations**: Homomorphic addition, multiplication, and rotation-based scoring
+### Available tools
 
-If you need to re-compile the C++ OpenFHE source into browser-ready WebAssembly and Javascript wrappers:
+| Tool | Description |
+|------|-------------|
+| `fetch_url(url)` | Fetches content from allowlisted URLs and returns cleaned text. Rejects non-allowlisted hosts. |
+| `search_project_context(project_id, query)` | Searches project context by calling back into the Express API (`/api/v1/projects/:id/context`). |
 
-1. Setup the Emscripten Compiler Environment inside `server/emsdk/`.
-2. Navigate to `server/openfhe-development/` and trigger the compiling recipe (requires `cmake` and toolchain setup).
-3. The build output will output Javascript glue-code and WASM files (e.g. `openfhe_pke_es6.js` and `openfhe_pke_es6.wasm`) into `server/fhe/` and `server/fhe-wasm/`.
-4. Update the server env var paths (`FHE_WASM_PATH`, `FHE_JS_PATH`) to point to these newly compiled WASM configurations.
+### Setup
 
-*Note: In mock environment modes (`ENCRYPTION_MODE=mock`), the backend routes fallback gracefully to `server/src/services/FHEStub.js` without failing application startup.*
+**1. Install dependencies**
 
-### FHE Chat Service (`server/src/services/fheChat.js`)
-Provides homomorphic scoring for chat context selection. Messages are encrypted and scored homomorphically without decrypting the content.
+```bash
+cd server/mcp-server
+pip install -e ".[dev]"
+```
 
----
+**2. Run the server** (choose one)
 
-## Model Context Protocol (MCP) Features
+<details open>
+<summary><b>Option A — stdio (local development)</b></summary>
 
-Secure Bridge includes a dedicated MCP Server (`server/mcp-server/`) built with FastMCP (Python) that provides context-aware tools for AI models. The server communicates with the Express backend via streamable-HTTP transport.
+```bash
+ENABLE_MCP=true \
+OUTBOUND_ALLOWLIST=api.example.com,localhost \
+MCP_TRANSPORT=stdio \
+python -m server
+```
 
-### Available MCP Tools
+</details>
 
-1. **`fetch_url(url)`** - Fetches content from allowlisted URLs and returns cleaned text. Rejects non-allowlisted hosts.
-2. **`search_project_context(project_id, query)`** - Searches project context by calling back into the Express API (`/api/v1/projects/:id/context`).
+<details open>
+<summary><b>Option B — streamable-HTTP (sidecar)</b></summary>
 
-### MCP Server Setup
+```bash
+ENABLE_MCP=true \
+OUTBOUND_ALLOWLIST=api.example.com,localhost,127.0.0.1 \
+MCP_TRANSPORT=streamable-http \
+MCP_SERVER_PORT=8787 \
+python -m server
+```
 
-1. Navigate to the MCP server directory:
-   ```bash
-   cd server/mcp-server
-   ```
+</details>
 
-2. Install Python dependencies:
-   ```bash
-   pip install -e ".[dev]"
-   ```
+The Express backend connects to `http://127.0.0.1:8787/mcp` when `ENABLE_MCP=true`.
 
-3. Start the MCP server (stdio transport for local dev):
-   ```bash
-   ENABLE_MCP=true \
-   OUTBOUND_ALLOWLIST=api.example.com,localhost \
-   MCP_TRANSPORT=stdio \
-   python -m server
-   ```
-
-4. Or start as a sidecar (streamable-HTTP transport):
-   ```bash
-   ENABLE_MCP=true \
-   OUTBOUND_ALLOWLIST=api.example.com,localhost,127.0.0.1 \
-   MCP_TRANSPORT=streamable-http \
-   MCP_SERVER_PORT=8787 \
-   python -m server
-   ```
-
-The Express backend will connect to `http://127.0.0.1:8787/mcp` when `ENABLE_MCP=true`.
-
-### MCP Configuration
+### Configuration reference
 
 | Variable | Default | Description |
-|---|---|---|
+|----------|---------|-------------|
 | `ENABLE_MCP` | `false` | Master switch for MCP features |
 | `OUTBOUND_ALLOWLIST` | _(empty)_ | Comma-separated hostnames. Empty = deny all (fail-closed) |
 | `MCP_TRANSPORT` | `stdio` | `stdio` for local dev, `streamable-http` for sidecar |
@@ -315,107 +348,98 @@ The Express backend will connect to `http://127.0.0.1:8787/mcp` when `ENABLE_MCP
 | `EXPRESS_API_BASE_URL` | `http://127.0.0.1:8000` | Express API base URL for callback tools |
 | `MCP_SERVICE_TOKEN` | _(required)_ | HMAC secret for user-scoped tool authentication |
 | `OUTBOUND_TIMEOUT_SECONDS` | `15` | Per-request HTTP timeout |
-| `FETCH_MAX_BYTES` | `1000000` | Max response body size |
+| `FETCH_MAX_BYTES` | `1000000` | Maximum response body size |
 
-> **Security Note**: The MCP server enforces a fail-closed security model. If `OUTBOUND_ALLOWLIST` is empty or unset, all outbound requests are denied. Redirects are re-checked hop-by-hop against the allowlist. No API keys, JWT tokens, or secrets are logged or exposed by the MCP server.
+> [!WARNING]
+> **Security model:** the MCP server is fail-closed. If `OUTBOUND_ALLOWLIST` is empty or unset, all outbound requests are denied. Redirects are re-checked hop-by-hop against the allowlist. No API keys, JWTs, or secrets are logged or exposed.
 
-### MCP Client Integration
+### MCP client (Express backend)
 
-The Express backend includes an MCP client (`server/src/services/mcpClient.js`) that:
+**File:** `server/src/services/mcpClient.js`
+
 - Connects to the MCP server only when `ENABLE_MCP=true`
 - Discovers available tools at startup
 - Passes tools to LLM calls in the chat service
-- Falls back gracefully (chat works without tools) if MCP server is unreachable
+- Falls back gracefully (chat works without tools) if the MCP server is unreachable
 - Verifies HMAC-signed user identities for user-scoped tools
 
 ---
 
-## Chat Encryption
+## 💬 Chat Encryption
 
-Secure Bridge provides end-to-end encryption for chat messages with multiple encryption backends:
+Secure Bridge provides end-to-end encryption for chat messages with multiple encryption backends.
 
-### Encryption Services
+### Services
 
 | Service | File | Purpose |
 |---------|------|---------|
 | `FHEStub.js` | `server/src/services/FHEStub.js` | Mock FHE implementation (AES-256-GCM) for development |
 | `OpenFheService.js` | `server/src/services/OpenFheService.js` | Real OpenFHE WASM-based BFV homomorphic encryption |
 | `fheChat.js` | `server/src/services/fheChat.js` | Homomorphic scoring for chat context selection |
-| `fheServiceFactory.js` | `server/src/services/fheServiceFactory.js` | Factory to create appropriate FHE service based on mode |
+| `fheServiceFactory.js` | `server/src/services/fheServiceFactory.js` | Creates the appropriate FHE service based on mode |
 
-### Encryption Modes
+### Message flow
 
-- **`ENCRYPTION_MODE=mock`** (default): Uses `FHEStub.js` with AES-256-GCM encryption. Always starts, suitable for development and testing.
-- **`ENCRYPTION_MODE=fhe`**: Uses real OpenFHE WASM with BFV scheme. Falls back to stub if WASM cannot load.
+```mermaid
+flowchart TD
+    A[User sends message via frontend] --> B[Backend encrypts with AES-256-GCM<br/>key derived from ENCRYPTION_KEY]
+    B --> C{FHE mode enabled?}
+    C -- Yes --> D[Apply additional homomorphic encryption]
+    C -- No --> E[Store encrypted message in MongoDB]
+    D --> E
+    E --> F[Homomorphic scoring for context selection<br/>FHE mode only]
+    F --> G[Response decrypted and returned to user]
+    E -. non-FHE mode .-> G
+```
 
-### Chat Message Flow
+### Modes
 
-1. User sends message via frontend
-2. Backend encrypts message with AES-256-GCM (key derived from `ENCRYPTION_KEY`)
-3. If FHE mode is enabled, additional homomorphic encryption is applied
-4. Message is stored in MongoDB in encrypted form
-5. For context selection, homomorphic scoring is used (FHE mode only)
-6. Response is decrypted and returned to user
+| Mode | Behavior |
+|------|----------|
+| `ENCRYPTION_MODE=mock` _(default)_ | `FHEStub.js` with AES-256-GCM. Always starts; ideal for development and testing. |
+| `ENCRYPTION_MODE=fhe` | Real OpenFHE WASM with BFV scheme. Falls back to the stub if WASM cannot load. |
 
-> **Security Note**: All API keys are encrypted at rest with AES-256-GCM. Plaintext keys are never exposed in API responses, logs, or client-side code.
-
----
-
-## Testing & Code Quality
-
-Run tests and style linters to verify your modifications before pushing commits.
-
-- **Backend Jest Tests**:
-  Runs database validation, API mock endpoints, and security tests:
-  ```bash
-  cd server
-  npm test
-  ```
-  Or get coverage stats:
-  ```bash
-  npm run test:coverage
-  ```
-
-  New test files added:
-  - `apiKey.test.js` - API key encryption and management tests
-  - `chatProviders.test.js` - Chat provider integration tests
-  - `fheChat.test.js` - FHE chat encryption and scoring tests
-  - `fheSelftestRunner.mjs` - FHE self-test runner
-  - `localLlm.test.js` - Local LLM integration tests
-  - `mcpClient.test.js` - MCP client integration tests
-  - `security.test.js` - Security validation tests
-
-- **Frontend Linting**:
-  ```bash
-  cd client
-  npm run lint
-  ```
-
-- **Frontend Tests**:
-  ```bash
-  cd client
-  npm test
-  ```
-  or in watch mode:
-  ```bash
-  npm run test:watch
-  ```
+> [!NOTE]
+> All API keys are encrypted at rest with AES-256-GCM. Plaintext keys are never exposed in API responses, logs, or client-side code.
 
 ---
 
-## Troubleshooting
+## 🧪 Testing & Code Quality
 
-- **Redis Offline Warning**:
-  If Redis fails to load or connect, the backend logs `Failed to connect to Redis` and logs a warning. **OTP flows will fallback automatically to local memory storage** (temporary codes will clear if the server restarts).
-- **CORS Failures**:
-  Ensure the `CORS_ORIGIN` variable inside `server/.env` exactly matches the local client URL (e.g. `http://localhost:5173`).
-- **Database Connection Failures**:
-  Verify the MongoDB URI in `server/.env`. For local docker setups, keep `MONGODB_URI=mongodb://admin:admin123@localhost:27017/Secure-Bridge?authSource=admin`.
-- **MCP Server Connection Issues**:
-  If `ENABLE_MCP=true` but the MCP server is unreachable, the backend will log a warning and continue without MCP tools. Chat functionality still works. Verify the MCP server is running and `MCP_SERVER_URL` is correct.
-- **FHE WASM Loading Errors**:
-  If `ENCRYPTION_MODE=fhe` but WASM files are missing, the backend automatically falls back to `FHEStub.js`. Ensure `FHE_WASM_PATH` and `FHE_JS_PATH` point to valid locations or place WASM files in `server/fhe/`.
-- **OUTBOUND_ALLOWLIST Denials**:
-  If MCP tools are rejecting all URLs, check that `OUTBOUND_ALLOWLIST` contains valid hostnames (comma-separated). Empty allowlist denies all requests by design (fail-closed security).
-- **HMAC Signature Failures**:
-  If user-scoped MCP tools are failing authentication, verify that `MCP_SERVICE_TOKEN` is set and matches between the MCP server and Express backend.
+Run tests and linters before pushing changes.
+
+| Area | Command | Notes |
+|------|---------|-------|
+| Backend tests | `cd server && npm test` | Database validation, API mock endpoints, security tests |
+| Backend coverage | `cd server && npm run test:coverage` | Coverage stats |
+| Frontend lint | `cd client && npm run lint` | Style linting |
+| Frontend tests | `cd client && npm test` | Add `npm run test:watch` for watch mode |
+
+<details>
+<summary><b>Backend test files</b></summary>
+
+| File | Covers |
+|------|--------|
+| `apiKey.test.js` | API key encryption and management |
+| `chatProviders.test.js` | Chat provider integration |
+| `fheChat.test.js` | FHE chat encryption and scoring |
+| `fheSelftestRunner.mjs` | FHE self-test runner |
+| `localLlm.test.js` | Local LLM integration |
+| `mcpClient.test.js` | MCP client integration |
+| `security.test.js` | Security validation |
+
+</details>
+
+---
+
+## 🛠️ Troubleshooting
+
+| Problem | What happens / How to fix |
+|---------|---------------------------|
+| **Redis offline warning** | The backend logs `Failed to connect to Redis` and warns. OTP flows fall back to in-memory storage (codes are lost on server restart). |
+| **CORS failures** | Make sure `CORS_ORIGIN` in `server/.env` exactly matches the client URL (e.g. `http://localhost:5173`). |
+| **Database connection failures** | Verify `MONGODB_URI` in `server/.env`. For local Docker, use `mongodb://admin:admin123@localhost:27017/Secure-Bridge?authSource=admin`. |
+| **MCP server unreachable** | If `ENABLE_MCP=true` but the server is down, the backend logs a warning and continues without MCP tools. Check the server is running and `MCP_SERVER_URL` is correct. |
+| **FHE WASM loading errors** | If `ENCRYPTION_MODE=fhe` but WASM files are missing, the backend falls back to `FHEStub.js`. Point `FHE_WASM_PATH` / `FHE_JS_PATH` to valid files or place them in `server/fhe/`. |
+| **`OUTBOUND_ALLOWLIST` denials** | If MCP tools reject every URL, check that the allowlist contains valid comma-separated hostnames. An empty list denies everything by design. |
+| **HMAC signature failures** | If user-scoped MCP tools fail authentication, confirm `MCP_SERVICE_TOKEN` is set and identical on the MCP server and the Express backend. |
