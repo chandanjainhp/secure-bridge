@@ -20,7 +20,7 @@ from fastmcp.exceptions import ToolError
 
 from .. import config
 from ..allowlist import MAX_REDIRECTS, get_allowlist
-from ..server import mcp
+from ..app import mcp
 
 log = logging.getLogger("mcp.tools.fetch_url")
 

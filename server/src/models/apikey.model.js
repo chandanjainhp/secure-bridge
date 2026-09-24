@@ -354,8 +354,9 @@ apiKeySchema.statics.verifyKey = function (providedKey) {
 apiKeySchema.statics.validateExternalKeyFormat = function (apiKey, provider) {
   const validations = {
     openai: {
-      pattern: /^sk-[A-Za-z0-9]{48}$/,
-      description: 'OpenAI keys start with "sk-" followed by 48 characters',
+      pattern: /^sk-(?:proj-)?[A-Za-z0-9_-]{20,}$/,
+      description:
+        'OpenAI keys start with "sk-" and contain at least 20 provider characters',
     },
     anthropic: {
       pattern: /^sk-ant-api\d{2}-[A-Za-z0-9_-]{95}$/,

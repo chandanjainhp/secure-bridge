@@ -32,8 +32,9 @@ describe('Usage API', () => {
       .set('Authorization', `Bearer ${authToken}`);
 
     expect(res.status).toBe(200);
-    expect(res.body.used).toBe(0);
-    expect(res.body.remaining).toBe(10);
-    expect(res.body.limit).toBe(10);
+    // ApiResponse envelope: { success, statusCode, data: { used, remaining, limit } }
+    expect(res.body.data.used).toBe(0);
+    expect(res.body.data.remaining).toBe(10);
+    expect(res.body.data.limit).toBe(10);
   });
 });

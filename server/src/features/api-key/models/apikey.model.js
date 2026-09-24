@@ -100,6 +100,7 @@ const apiKeySchema = new Schema(
         "cohere",
         "huggingface",
         "replicate",
+        "local",
         "custom",
       ],
       required: function () {
@@ -109,19 +110,19 @@ const apiKeySchema = new Schema(
     externalKeyEncrypted: {
       type: String,
       required: function () {
-        return this.isExternal;
+        return this.isExternal && this.externalProvider !== "local";
       },
     },
     encryptionIV: {
       type: String,
       required: function () {
-        return this.isExternal;
+        return this.isExternal && this.externalProvider !== "local";
       },
     },
     encryptionTag: {
       type: String,
       required: function () {
-        return this.isExternal;
+        return this.isExternal && this.externalProvider !== "local";
       },
     },
 
@@ -264,6 +265,11 @@ const apiKeySchema = new Schema(
 
     // Advanced Settings
     settings: {
+      localLlm: {
+        baseUrl: { type: String, trim: true, maxlength: 500 },
+        model: { type: String, trim: true, maxlength: 200 },
+        enabled: { type: Boolean, default: true },
+      },
       allowConcurrentRequests: {
         type: Boolean,
         default: true,
@@ -347,8 +353,9 @@ apiKeySchema.statics.verifyKey = function (providedKey) {
 apiKeySchema.statics.validateExternalKeyFormat = function (apiKey, provider) {
   const validations = {
     openai: {
-      pattern: /^sk-[A-Za-z0-9]{48}$/,
-      description: 'OpenAI keys start with "sk-" followed by 48 characters',
+      pattern: /^sk-(?:proj-)?[A-Za-z0-9_-]{20,}$/,
+      description:
+        'OpenAI keys start with "sk-" and contain at least 20 provider characters',
     },
     anthropic: {
       pattern: /^sk-ant-api\d{2}-[A-Za-z0-9_-]{95}$/,
@@ -792,8 +799,12 @@ apiKeySchema.pre("save", function (next) {
     this.status = "expired";
   }
 
-  // Ensure encrypted fields are present for external keys
-  if (this.isExternal && !this.externalKeyEncrypted) {
+  // Cloud external keys require encryption; local servers may not require a token.
+  if (
+    this.isExternal &&
+    this.externalProvider !== "local" &&
+    !this.externalKeyEncrypted
+  ) {
     return next(new Error("External keys must be encrypted"));
   }
 

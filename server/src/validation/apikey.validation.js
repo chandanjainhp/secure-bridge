@@ -1,7 +1,6 @@
 import { isIP } from "node:net";
 import { z } from "zod";
 
-
 const providerEnum = z.enum([
   "openai",
   "anthropic",
@@ -11,15 +10,19 @@ const providerEnum = z.enum([
   "cohere",
   "huggingface",
   "replicate",
+  "local",
   "custom",
 ]);
 
+const localLlmSettings = z.object({
+  baseUrl: z.string().trim().url().max(500),
+  model: z.string().trim().min(1).max(200),
+  enabled: z.boolean().optional().default(true),
+});
+
 const keyIdParam = z.object({
   params: z.object({
-    keyId: z
-      .string()
-      .trim()
-      .min(1, "keyId is required"),
+    keyId: z.string().trim().min(1, "keyId is required"),
   }),
 });
 
@@ -29,7 +32,7 @@ export const getAllApiKeysSchema = z.object({
   query: z.object({
     includeRevoked: z.enum(["true", "false"]).optional().default("false"),
     search: z.string().trim().optional().default(""),
-    provider: providerEnum.optional().default(null),
+    provider: providerEnum.nullable().optional().default(null),
     sortBy: z
       .enum(["createdAt", "name", "updatedAt", "lastUsedAt"])
       .optional()
@@ -43,50 +46,64 @@ export const getAllApiKeysSchema = z.object({
 // --- POST /api-keys (create) ---
 
 export const createApiKeySchema = z.object({
-  body: z.object({
-    name: z
-      .string()
-      .trim()
-      .min(1, "Name is required")
-      .max(100, "Name must be at most 100 characters"),
-    description: z
-      .string()
-      .trim()
-      .max(500, "Description must be at most 500 characters")
-      .optional()
-      .default(""),
-    permissions: z
-      .array(z.enum([
-        "chat.access", "chat.completions", "chat.streaming",
-        "fhe.encrypt", "fhe.decrypt", "fhe.compute", "fhe.ai_chat",
-        "mcp.connect", "mcp.tools", "user.read", "user.write",
-        "admin.read", "admin.write", "analytics.read", "keys.read",
-        "keys.write", "keys.delete",
-      ]))
-      .optional()
-      .default([]),
-    rateLimit: z
-      .object({
-        requestsPerMinute: z.number().int().min(1).max(1000).optional(),
-        requestsPerHour: z.number().int().min(1).max(50000).optional(),
-        requestsPerDay: z.number().int().min(1).max(1000000).optional(),
-      })
-      .optional()
-      .default({}),
-    expiresAt: z
-      .string()
-      .datetime()
-      .optional()
-      .nullable()
-      .transform((v) => (v ? new Date(v) : null)),
-    ipWhitelist: z
-      .array(
-        z
-          .string()
-          .trim()
-          .min(1)
-          .refine(
-            (ip) => {
+  body: z
+    .object({
+      name: z
+        .string()
+        .trim()
+        .min(1, "Name is required")
+        .max(100, "Name must be at most 100 characters"),
+      description: z
+        .string()
+        .trim()
+        .max(500, "Description must be at most 500 characters")
+        .optional()
+        .default(""),
+      permissions: z
+        .array(
+          z.enum([
+            "chat.access",
+            "chat.completions",
+            "chat.streaming",
+            "fhe.encrypt",
+            "fhe.decrypt",
+            "fhe.compute",
+            "fhe.ai_chat",
+            "mcp.connect",
+            "mcp.tools",
+            "user.read",
+            "user.write",
+            "admin.read",
+            "admin.write",
+            "analytics.read",
+            "keys.read",
+            "keys.write",
+            "keys.delete",
+          ]),
+        )
+        .optional()
+        .default([]),
+      rateLimit: z
+        .object({
+          requestsPerMinute: z.number().int().min(1).max(1000).optional(),
+          requestsPerHour: z.number().int().min(1).max(50000).optional(),
+          requestsPerDay: z.number().int().min(1).max(1000000).optional(),
+        })
+        .optional()
+        .default({}),
+      expiresAt: z
+        .string()
+        .datetime()
+        .optional()
+        .nullable()
+        .transform((v) => (v ? new Date(v) : null)),
+      ipWhitelist: z
+        .array(
+          z
+            .string()
+            .trim()
+            .min(1)
+            .refine((ip) => {
               const [address, prefix] = ip.split("/");
               const version = isIP(address);
               if (!version) return false;
@@ -94,29 +111,38 @@ export const createApiKeySchema = z.object({
               const max = version === 4 ? 32 : 128;
               const bits = Number(prefix);
               return Number.isInteger(bits) && bits >= 0 && bits <= max;
-            },
-            "Invalid IP address format"
-          )
-      )
-      .optional()
-      .default([]),
-    domainWhitelist: z
-      .array(
-        z
-          .string()
-          .trim()
-          .min(1)
-          .refine(
-            (d) => /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(d),
-            "Invalid domain format"
-          )
-      )
-      .optional()
-      .default([]),
-    externalKey: z.string().trim().min(1).optional(),
-    provider: providerEnum.optional(),
-    settings: z.record(z.any()).optional().default({}),
-  }),
+            }, "Invalid IP address format"),
+        )
+        .optional()
+        .default([]),
+      domainWhitelist: z
+        .array(
+          z
+            .string()
+            .trim()
+            .min(1)
+            .refine(
+              (d) => /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(d),
+              "Invalid domain format",
+            ),
+        )
+        .optional()
+        .default([]),
+      externalKey: z.string().trim().min(1).optional(),
+      provider: providerEnum.optional(),
+      settings: z.record(z.any()).optional().default({}),
+    })
+    .superRefine((body, context) => {
+      if (body.provider !== "local") return;
+      const result = localLlmSettings.safeParse(body.settings?.localLlm);
+      if (!result.success) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["settings", "localLlm"],
+          message: "Local LLM baseUrl and model are required",
+        });
+      }
+    }),
 });
 
 // --- PATCH /api-keys/:keyId (update) ---
@@ -138,13 +164,30 @@ export const updateApiKeySchema = z.object({
         .trim()
         .max(500, "Description must be at most 500 characters")
         .optional(),
-      permissions: z.array(z.enum([
-        "chat.access", "chat.completions", "chat.streaming",
-        "fhe.encrypt", "fhe.decrypt", "fhe.compute", "fhe.ai_chat",
-        "mcp.connect", "mcp.tools", "user.read", "user.write",
-        "admin.read", "admin.write", "analytics.read", "keys.read",
-        "keys.write", "keys.delete",
-      ])).optional(),
+      externalKey: z.string().trim().min(1).optional(),
+      permissions: z
+        .array(
+          z.enum([
+            "chat.access",
+            "chat.completions",
+            "chat.streaming",
+            "fhe.encrypt",
+            "fhe.decrypt",
+            "fhe.compute",
+            "fhe.ai_chat",
+            "mcp.connect",
+            "mcp.tools",
+            "user.read",
+            "user.write",
+            "admin.read",
+            "admin.write",
+            "analytics.read",
+            "keys.read",
+            "keys.write",
+            "keys.delete",
+          ]),
+        )
+        .optional(),
       rateLimit: z
         .object({
           requestsPerMinute: z.number().int().min(1).max(1000).optional(),
@@ -158,18 +201,15 @@ export const updateApiKeySchema = z.object({
             .string()
             .trim()
             .min(1)
-            .refine(
-              (ip) => {
-                const [address, prefix] = ip.split("/");
-                const version = isIP(address);
-                if (!version) return false;
-                if (prefix === undefined) return true;
-                const max = version === 4 ? 32 : 128;
-                const bits = Number(prefix);
-                return Number.isInteger(bits) && bits >= 0 && bits <= max;
-              },
-              "Invalid IP address format"
-            )
+            .refine((ip) => {
+              const [address, prefix] = ip.split("/");
+              const version = isIP(address);
+              if (!version) return false;
+              if (prefix === undefined) return true;
+              const max = version === 4 ? 32 : 128;
+              const bits = Number(prefix);
+              return Number.isInteger(bits) && bits >= 0 && bits <= max;
+            }, "Invalid IP address format"),
         )
         .optional(),
       domainWhitelist: z
@@ -180,8 +220,8 @@ export const updateApiKeySchema = z.object({
             .min(1)
             .refine(
               (d) => /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(d),
-              "Invalid domain format"
-            )
+              "Invalid domain format",
+            ),
         )
         .optional(),
       settings: z.record(z.any()).optional(),
@@ -199,7 +239,10 @@ export const testApiKeySchema = z.object({
     keyId: z.string().trim().min(1, "keyId is required"),
   }),
   body: z.object({
-    testType: z.enum(["basic", "full", "connectivity"]).optional().default("basic"),
+    testType: z
+      .enum(["basic", "full", "connectivity"])
+      .optional()
+      .default("basic"),
   }),
 });
 
@@ -220,7 +263,10 @@ export const getUsageAnalyticsSchema = z.object({
       .datetime()
       .optional()
       .transform((v) => (v ? new Date(v) : null)),
-    granularity: z.enum(["hour", "day", "week", "month"]).optional().default("day"),
+    granularity: z
+      .enum(["hour", "day", "week", "month"])
+      .optional()
+      .default("day"),
     includeEndpoints: z.enum(["true", "false"]).optional().default("true"),
   }),
 });
@@ -229,10 +275,7 @@ export const getUsageAnalyticsSchema = z.object({
 
 export const validateExternalKeyFormatSchema = z.object({
   body: z.object({
-    apiKey: z
-      .string()
-      .trim()
-      .min(1, "apiKey is required"),
+    apiKey: z.string().trim().min(1, "apiKey is required"),
     provider: providerEnum,
   }),
 });
@@ -241,10 +284,7 @@ export const validateExternalKeyFormatSchema = z.object({
 
 export const testExternalKeyConnectivitySchema = z.object({
   body: z.object({
-    apiKey: z
-      .string()
-      .trim()
-      .min(1, "apiKey is required"),
+    apiKey: z.string().trim().min(1, "apiKey is required"),
     provider: providerEnum,
   }),
 });
@@ -261,13 +301,29 @@ export const bulkUpdateApiKeysSchema = z.object({
       .object({
         name: z.string().trim().min(1).max(100).optional(),
         description: z.string().trim().max(500).optional(),
-        permissions: z.array(z.enum([
-        "chat.access", "chat.completions", "chat.streaming",
-        "fhe.encrypt", "fhe.decrypt", "fhe.compute", "fhe.ai_chat",
-        "mcp.connect", "mcp.tools", "user.read", "user.write",
-        "admin.read", "admin.write", "analytics.read", "keys.read",
-        "keys.write", "keys.delete",
-      ])).optional(),
+        permissions: z
+          .array(
+            z.enum([
+              "chat.access",
+              "chat.completions",
+              "chat.streaming",
+              "fhe.encrypt",
+              "fhe.decrypt",
+              "fhe.compute",
+              "fhe.ai_chat",
+              "mcp.connect",
+              "mcp.tools",
+              "user.read",
+              "user.write",
+              "admin.read",
+              "admin.write",
+              "analytics.read",
+              "keys.read",
+              "keys.write",
+              "keys.delete",
+            ]),
+          )
+          .optional(),
         rateLimit: z
           .object({
             requestsPerMinute: z.number().int().min(1).max(1000).optional(),

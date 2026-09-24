@@ -67,26 +67,29 @@ async function executeCompletion(res, model, messages, params) {
     providerUsed,
   } = params;
 
-  if (stream) {
-    const result = streamText({
-      model,
-      messages,
-      temperature,
-      maxTokens: max_tokens,
-      topP: top_p,
-      stopSequences: stop,
-    });
-    return result.toDataStreamResponse(res);
-  }
-
-  const result = await generateText({
+  const systemMessages = messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content)
+    .filter(Boolean);
+  const modelMessages = messages.filter((message) => message.role !== "system");
+  const promptOptions = {
     model,
-    messages,
+    messages: modelMessages,
+    ...(systemMessages.length > 0
+      ? { system: systemMessages.join("\n\n") }
+      : {}),
     temperature,
     maxTokens: max_tokens,
     topP: top_p,
     stopSequences: stop,
-  });
+  };
+
+  if (stream) {
+    const result = streamText(promptOptions);
+    return result.toDataStreamResponse(res);
+  }
+
+  const result = await generateText(promptOptions);
 
   return res
     .status(200)
@@ -172,16 +175,44 @@ class ChatController {
     }
 
     // --- External provider path ---
-    const instance = await getModelInstance(
+    let instance = await getModelInstance(
       selectedProvider,
       selectedModel,
       userId,
     );
 
     if (!instance) {
+      // Existing projects may still contain a cloud model from before a local
+      // connection was configured. Use the local profile when no cloud key exists.
+      instance = await getModelInstance(
+        "local",
+        "local",
+        userId,
+        null,
+        false,
+      ).catch(() => null);
+      if (instance) {
+        const localResult = await executeCompletion(
+          res,
+          instance.model,
+          messages,
+          {
+            ...params,
+            modelName: "local",
+            providerUsed: instance.providerUsed,
+          },
+        );
+        if (userId) {
+          usageService.incrementUsage(userId).catch((err) => {
+            console.error("Failed to track usage:", err.message);
+          });
+        }
+        return localResult;
+      }
+
       throw new ApiError(
         502,
-        `No API key found for provider "${selectedProvider}". Ensure you have an active API key with chat permissions.`,
+        `No API key found for provider "${selectedProvider}", and no local LLM connection is available. Configure a provider key or select a configured local model.`,
       );
     }
 

@@ -119,16 +119,19 @@ const login = asyncHandler(async (req, res) => {
   const { email, username, password, rememberMe } = req.body;
 
   // Rate limiting check (10 login attempts per minute per IP)
-  const ipAddress = req.ip || req.socket?.remoteAddress;
-  const rateLimit = await redisService.incrementRateLimit(
-    `login:${ipAddress}`,
-    60,
-  );
-  if (rateLimit.count > 10) {
-    throw new ApiError(
-      429,
-      "Too many login attempts. Please try again in a minute.",
+  // dev bypass: two layered limiters make rapid local retries trip 429s constantly
+  if (process.env.NODE_ENV !== "development") {
+    const ipAddress = req.ip || req.socket?.remoteAddress;
+    const rateLimit = await redisService.incrementRateLimit(
+      `login:${ipAddress}`,
+      60,
     );
+    if (rateLimit.count > 10) {
+      throw new ApiError(
+        429,
+        "Too many login attempts. Please try again in a minute.",
+      );
+    }
   }
 
   // Find the user by username or email

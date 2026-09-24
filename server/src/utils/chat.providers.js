@@ -11,10 +11,16 @@
  */
 
 import { ApiKey } from "../features/api-key/models/apikey.model.js";
+import { assertLocalLlmHost, normalizeLocalLlmUrl } from "./localLlm.js";
 
-const loadOpenAI = () => import("@ai-sdk/openai").then(({ createOpenAI }) => createOpenAI);
-const loadAnthropic = () => import("@ai-sdk/anthropic").then(({ createAnthropic }) => createAnthropic);
-const loadGoogle = () => import("@ai-sdk/google").then(({ createGoogleGenerativeAI }) => createGoogleGenerativeAI);
+const loadOpenAI = () =>
+  import("@ai-sdk/openai").then(({ createOpenAI }) => createOpenAI);
+const loadAnthropic = () =>
+  import("@ai-sdk/anthropic").then(({ createAnthropic }) => createAnthropic);
+const loadGoogle = () =>
+  import("@ai-sdk/google").then(
+    ({ createGoogleGenerativeAI }) => createGoogleGenerativeAI,
+  );
 
 // ============================================================
 // LLM SERVER CONFIG
@@ -42,10 +48,10 @@ const providerFactories = {
    * Local LLM (LM Studio, Ollama, etc.) — these servers expose an
    * OpenAI-compatible API, so we reuse `createOpenAI` with a custom baseURL.
    */
-  local: async () =>
+  local: async (apiKey, baseURL = LLM_SERVER_URL) =>
     (await loadOpenAI())({
-      baseURL: LLM_SERVER_URL,
-      apiKey: "not-needed", // LM Studio doesn't require a key
+      baseURL,
+      apiKey: apiKey || "not-needed",
     }),
 };
 
@@ -56,8 +62,8 @@ const providerFactories = {
 const MODEL_CATALOGS = {
   local: [
     {
-      id: "gemma-3-4b-it-qat",
-      name: "Gemma 3 4B (Local)",
+      id: "google/gemma-4-e4b",
+      name: "Gemma 4 E4B (LM Studio)",
       description: `Local Gemma model running on ${LLM_SERVER_URL}`,
       type: "local",
       requiresApiKey: false,
@@ -67,7 +73,8 @@ const MODEL_CATALOGS = {
     {
       id: "gemini-2.5-flash",
       name: "Gemini 2.5 Flash",
-      description: "Stable version of Gemini 2.5 Flash, mid-size multimodal model (June 2025)",
+      description:
+        "Stable version of Gemini 2.5 Flash, mid-size multimodal model (June 2025)",
       type: "api",
       provider: "google",
       requiresApiKey: true,
@@ -83,7 +90,8 @@ const MODEL_CATALOGS = {
     {
       id: "gemini-2.0-flash",
       name: "Gemini 2.0 Flash",
-      description: "Fast and versatile multimodal model for scaling across diverse tasks",
+      description:
+        "Fast and versatile multimodal model for scaling across diverse tasks",
       type: "api",
       provider: "google",
       requiresApiKey: true,
@@ -140,11 +148,13 @@ const MODEL_CATALOGS = {
 // ============================================================
 
 const DEFAULT_MODELS = {
-  local: "gemma-3-4b-it-qat",
+  local: "google/gemma-4-e4b",
   google: "gemini-2.5-flash",
   openai: "gpt-4o-mini",
   anthropic: "claude-3-5-sonnet-20241022",
 };
+
+const LOCAL_MODEL = DEFAULT_MODELS.local;
 
 // ============================================================
 // PROVIDER DETECTION
@@ -164,22 +174,41 @@ function detectProvider(model, requestedProvider = "auto") {
   if (requestedProvider && requestedProvider !== "auto") {
     return {
       provider: requestedProvider,
-      model: model || DEFAULT_MODELS[requestedProvider] || model,
+      model:
+        normalizeModelName(model, requestedProvider) ||
+        DEFAULT_MODELS[requestedProvider] ||
+        model,
     };
   }
 
+  if (model === LOCAL_MODEL || model === "local") {
+    return { provider: "local", model: LOCAL_MODEL };
+  }
+
   const match = PROVIDER_KEYWORDS.find((p) =>
-    p.keywords.some((kw) => model?.toLowerCase().includes(kw))
+    p.keywords.some((kw) => model?.toLowerCase().includes(kw)),
   );
 
   if (match) {
     return {
       provider: match.provider,
-      model: model || DEFAULT_MODELS[match.provider],
+      model:
+        normalizeModelName(model, match.provider) ||
+        DEFAULT_MODELS[match.provider],
     };
   }
 
-  return { provider: "local", model: model || DEFAULT_MODELS.local };
+  return {
+    provider: "local",
+    model: normalizeModelName(model, "local") || DEFAULT_MODELS.local,
+  };
+}
+
+function normalizeModelName(model, provider) {
+  const prefix = `${provider}/`;
+  return typeof model === "string" && model.startsWith(prefix)
+    ? model.slice(prefix.length)
+    : model;
 }
 
 // ============================================================
@@ -240,7 +269,11 @@ async function findExternalKeys(userId) {
 async function decryptApiKey(apiKeyDoc) {
   // All API keys (internal and external) should now be encrypted
   // If encryption fields are missing, the key cannot be decrypted
-  if (!apiKeyDoc.externalKeyEncrypted || !apiKeyDoc.encryptionIV || !apiKeyDoc.encryptionTag) {
+  if (
+    !apiKeyDoc.externalKeyEncrypted ||
+    !apiKeyDoc.encryptionIV ||
+    !apiKeyDoc.encryptionTag
+  ) {
     console.error("❌ API key is not encrypted - missing encryption fields");
     return null;
   }
@@ -278,13 +311,46 @@ async function getModelInstance(
   provider,
   modelName,
   userId,
-  forcedApiKeyDoc = null
+  forcedApiKeyDoc = null,
+  allowDefaultLocal = true,
 ) {
-  // Local — no API key needed
+  // Local — use the user's configured compatible server when available.
   if (provider === "local") {
-    const client = await providerFactories.local();
+    let localConfig = null;
+    if (userId) {
+      localConfig = await ApiKey.findOne({
+        userId,
+        status: "active",
+        externalProvider: "local",
+        "settings.localLlm.enabled": { $ne: false },
+        permissions: { $in: ["chat.access", "chat.completions"] },
+      });
+    }
+
+    if (!localConfig && !allowDefaultLocal) {
+      return null;
+    }
+
+    let baseURL = LLM_SERVER_URL;
+    let localApiKey = null;
+    let resolvedModel =
+      !modelName || modelName === "local" ? DEFAULT_MODELS.local : modelName;
+    if (localConfig?.settings?.localLlm?.baseUrl) {
+      const validatedBaseUrl = await assertLocalLlmHost(
+        localConfig.settings.localLlm.baseUrl,
+      );
+      baseURL = validatedBaseUrl.endsWith("/v1")
+        ? validatedBaseUrl
+        : `${validatedBaseUrl}/v1`;
+      resolvedModel =
+        !modelName || modelName === "local"
+          ? localConfig.settings.localLlm.model
+          : modelName;
+    }
+
+    const client = await providerFactories.local(localApiKey, baseURL);
     return {
-      model: client(modelName),
+      model: client(resolvedModel),
       providerUsed: "local",
     };
   }
@@ -320,9 +386,10 @@ async function getModelInstance(
 // LOCAL LLM HEALTH CHECK
 // ============================================================
 
-async function checkLocalLLMHealth() {
+async function checkLocalLLMHealth(userId = null) {
   try {
-    const response = await fetch(`${LLM_SERVER_URL}/models`, {
+    const baseURL = await getLocalLlmBaseUrl(userId);
+    const response = await fetch(`${baseURL}/models`, {
       method: "GET",
       signal: AbortSignal.timeout(3000),
     });
@@ -332,8 +399,25 @@ async function checkLocalLLMHealth() {
   }
 }
 
-async function getLocalModels() {
-  const response = await fetch(`${LLM_SERVER_URL}/models`, {
+async function getLocalLlmBaseUrl(userId = null) {
+  if (userId) {
+    const localConfig = await ApiKey.findOne({
+      userId,
+      status: "active",
+      externalProvider: "local",
+      "settings.localLlm.enabled": { $ne: false },
+      permissions: { $in: ["chat.access", "chat.completions"] },
+    });
+    if (localConfig?.settings?.localLlm?.baseUrl) {
+      return assertLocalLlmHost(localConfig.settings.localLlm.baseUrl);
+    }
+  }
+  return normalizeLocalLlmUrl(LLM_SERVER_URL);
+}
+
+async function getLocalModels(userId = null) {
+  const baseURL = await getLocalLlmBaseUrl(userId);
+  const response = await fetch(`${baseURL}/models`, {
     method: "GET",
     signal: AbortSignal.timeout(3000),
   });
@@ -361,6 +445,7 @@ export {
   // Constants
   LLM_SERVER_URL,
   DEFAULT_MODELS,
+  LOCAL_MODEL,
   MODEL_CATALOGS,
   FALLBACK_CHAIN,
   // API key helpers
@@ -370,4 +455,5 @@ export {
   // Health
   checkLocalLLMHealth,
   getLocalModels,
+  getLocalLlmBaseUrl,
 };

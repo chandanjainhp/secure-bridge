@@ -8,7 +8,13 @@
 
 Secure Bridge solves the problem of securely using third-party LLM APIs (OpenAI, Anthropic, Gemini, Azure) without exposing API keys to the frontend or to the LLM provider beyond what is necessary. It provides an encrypted messaging and chat environment where users bring their own keys (BYOK), keys are encrypted at rest, usage is tracked and rate-limited, and confidential data can be processed using Fully Homomorphic Encryption (FHE) via WebAssembly.
 
----
+---curl http://localhost:1234/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemma-4-e4b",
+    "system_prompt": "You answer only in rhymes.",
+    "input": "What is your favorite color?"
+}'
 
 ## Intended Users
 
@@ -164,9 +170,11 @@ Secure Bridge is a hybrid web application with a clear client-server separation:
 
 ### FHE / Confidential Computing
 
-- Experimental support for Fully Homomorphic Encryption using OpenFHE compiled to WebAssembly.
-- Mock mode (`ENCRYPTION_MODE=mock`) falls back to `FHEStub.js` — application does not fail to start.
-- FHE WASM paths configured via `FHE_WASM_PATH` and `FHE_JS_PATH` environment variables.
+- **Real FHE is active.** `OpenFheService.js` (`server/src/services/`) loads the compiled OpenFHE WebAssembly module (`server/fhe/openfhe_pke_es6.{js,wasm}`) and runs genuine BFV homomorphic operations: encryption/decryption of byte-packed texts, ciphertext-ciphertext add/multiply, rotations, and ciphertext-only keyword scoring (`EvalMultCipherPlaintext` + rotation-sum tree; only scalar scores are decrypted).
+- Mode switch via `ENCRYPTION_MODE`: `mock` → `FHEStub.js` (honest AES-256-GCM simulation); `fhe` → real OpenFHE WASM with **automatic fallback to the stub** if the module cannot load, so the application never fails to start. The active backend is reported by `GET /api/v1/fhe/status` and `GET /api/v1/fhe/capabilities` (`realFHE: true|false`, `fallbackReason`).
+- FHE WASM paths configured via `FHE_WASM_PATH` and `FHE_JS_PATH` environment variables (defaults resolve to `server/fhe/`).
+- **Chat integration** (`fheChat.js`, active in `fhe` mode): messages are encrypted at rest in MongoDB with AES-256-GCM keyed from `ENCRYPTION_KEY` (HKDF) — decrypt-on-read via the projects API, transparent to the client, which shows an `FHE` badge from the message's `fhe` metadata. Prompt history is ranked for relevance using homomorphic BFV word-bucket scoring before the LLM call (verified in server logs: `FHE retrieval: enabled=true … scheme=BFV; on-ciphertext=true`).
+- Honest limitations: BFV keys are ephemeral (the WASM bindings expose no secret-key serialization), so BFV ciphertexts live in memory and the durable at-rest layer is AES-256-GCM; no current FHE scheme can run an LLM on ciphertext, so model inference always receives plaintext.
 
 ---
 
@@ -278,14 +286,17 @@ Secure Bridge is a hybrid web application with a clear client-server separation:
 
 ### MCP Integration
 
+Implemented as a separate Python FastMCP server (`server/mcp-server/`, streamable-HTTP on `:8787`) that the Express backend connects to as an MCP client. The live chat path (`chat.controller.js`) attaches discovered MCP tools to every completion; there is no dead `chatService.js` integration — that file is unused.
+
 | # | Criterion | Verification |
 |---|-----------|--------------|
 | AC-MCP-1 | MCP is disabled by default | With `ENABLE_MCP` unset/false, MCP features are not available |
-| AC-MCP-2 | MCP can be enabled via environment | With `ENABLE_MCP=true`, MCP tools are available in chat |
-| AC-MCP-3 | Outbound calls respect allowlist | Calls to non-allowlisted URLs are blocked |
-| AC-MCP-4 | MCP service integrates with chat service | `server/src/features/chat/services/chatService.js` contains MCP integration logic |
+| AC-MCP-2 | MCP can be enabled via environment | With `ENABLE_MCP=true`, MCP tools are available in chat (`GET /api/v1/chat/tools` shows discovery status) |
+| AC-MCP-3 | Outbound calls respect allowlist | `OUTBOUND_ALLOWLIST` (JSON array or comma-separated, regex patterns allowed) — non-allowlisted hosts return an `isError` result; empty allowlist denies everything (fail-closed) |
+| AC-MCP-4 | MCP tools execute in the live chat path | Local models use a prompt-protocol loop (`TOOL_CALL:` convention, works with any LM Studio model); cloud providers use native AI SDK tool calling with `stopWhen` cap and a retry-without-tools fallback |
+| AC-MCP-5 | User-scoped tool access is authenticated | Backend injects an HMAC-signed identity (`MCP_SERVICE_TOKEN`) into tool args; the `/projects/:id/context` endpoint verifies it and scopes reads to that user only |
 
-> `[VERIFY]` Exact MCP protocol, tool list, and allowlist enforcement mechanism require code inspection.
+Tools: `fetch_url` (allowlisted URL fetcher), `search_project_context` (calls back into the Express API rather than MongoDB directly, so authz stays in one place).
 
 ### FHE
 

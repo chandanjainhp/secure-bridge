@@ -8,6 +8,10 @@ The Express endpoint shape is a [VERIFY] item. The implementation below
 assumes a reasonable convention (``/api/v1/projects/:id/context?q=...``) and
 is isolated behind :func:`search_project_context` so it can be re-pointed once
 the real route is confirmed.
+User scoping: the Express backend signs the chatting user's id with the
+shared ``MCP_SERVICE_TOKEN`` (``__user_id`` + ``__user_sig`` arguments) when
+the LLM invokes this tool. Express verifies the HMAC-SHA256 signature and
+scopes the query to that exact user — the tool itself holds no credentials.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from fastmcp.exceptions import ToolError
 
 from .. import config
 from ..allowlist import get_allowlist
-from ..server import mcp
+from ..app import mcp
 
 log = logging.getLogger("mcp.tools.search_project_context")
 
@@ -29,6 +33,8 @@ log = logging.getLogger("mcp.tools.search_project_context")
 async def search_project_context(
     project_id: Annotated[str, "The project identifier (path segment)."],
     query: Annotated[str, "Natural-language query to match against project context."],
+    __user_id: Annotated[str | None, "Internal: signed user identity, injected by the backend."] = None,
+    __user_sig: Annotated[str | None, "Internal: HMAC-SHA256 of __user_id with MCP_SERVICE_TOKEN."] = None,
 ) -> list[str]:
     """Return relevant conversation history / project settings from the backend.
 
@@ -55,13 +61,17 @@ async def search_project_context(
         f"{quote(project_id, safe='')}/context"
     )
     params = {"q": query}
+    headers = {}
+    if __user_id and __user_sig:
+        headers["X-Service-User"] = __user_id
+        headers["X-Service-Signature"] = __user_sig
 
     try:
         async with httpx.AsyncClient(
             timeout=settings.outbound_timeout_seconds,
             follow_redirects=False,
         ) as client:
-            response = await client.get(url, params=params)
+            response = await client.get(url, params=params, headers=headers)
             response.raise_for_status()
             data = response.json()
     except ToolError:
@@ -78,7 +88,10 @@ async def search_project_context(
         log.warning("search_project_context unexpected error: %s", type(exc).__name__)
         raise ToolError("An unexpected error occurred while querying project context.") from exc
 
-    # Normalize the response into a list[str] regardless of exact API shape.
+    # The Express ApiResponse envelope is { success, statusCode, message, data };
+    # unwrap `data` and normalize into a list[str] regardless of exact shape.
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = data["data"]
     if isinstance(data, list):
         return [str(item) for item in data]
     if isinstance(data, dict):

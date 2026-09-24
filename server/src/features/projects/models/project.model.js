@@ -10,6 +10,9 @@ const messageSchema = new mongoose.Schema(
     },
     content: { type: String, required: true, maxlength: 32768 },
     createdAt: { type: Date, default: Date.now },
+    // FHE chat integration: when ENCRYPTION_MODE=fhe, `content` holds an
+    // AES-256-GCM at-rest envelope (JSON) and this metadata records that.
+    fhe: { type: mongoose.Schema.Types.Mixed, default: null },
   },
   { _id: false },
 );

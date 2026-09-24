@@ -75,8 +75,21 @@ class Allowlist:
             return AllowlistDecision(
                 False, host, "outbound allowlist is empty (fail-closed)"
             )
-        if host in self.hosts:
+        hosts = self.hosts
+        if host in hosts:
             return AllowlistDecision(True, host, "allowlisted")
+        # Entries beginning with "^" are hostname regex patterns (e.g.
+        # "^.*\.googleapis\.com$"). A pattern matches if the hostname fits.
+        import re
+
+        for entry in hosts:
+            if entry.startswith("^"):
+                try:
+                    if re.match(entry, host):
+                        return AllowlistDecision(True, host, "allowlisted (pattern)")
+                except re.error:
+                    log.warning("invalid allowlist pattern: %s", entry)
+                    continue
         return AllowlistDecision(False, host, "host not on allowlist")
 
     def assert_host_allowed(self, host: str | None, *, tool: str = "unknown") -> None:

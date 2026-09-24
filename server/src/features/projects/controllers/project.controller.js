@@ -3,6 +3,10 @@ import { asyncHandler } from "../../../utils/asyncHandler.js";
 import { ApiError } from "../../../utils/ApiError.js";
 import { ApiResponse } from "../../../utils/ApiResponse.js";
 import { Project } from "../models/project.model.js";
+import {
+  sealMessageForStorage,
+  unsealMessageFromStorage,
+} from "../../../services/fheChat.js";
 
 const ownedProject = (projectId, userId) => Project.findOne({ _id: projectId, owner: userId });
 const conversation = async (projectId, userId, conversationId) => {
@@ -20,11 +24,52 @@ export const updateProject = asyncHandler(async (req, res) => { const project = 
 export const deleteProject = asyncHandler(async (req, res) => { const deleted = await Project.findOneAndDelete({ _id: req.params.projectId, owner: req.user._id }); if (!deleted) throw new ApiError(404, "Project not found"); return res.status(200).json(new ApiResponse(200, { id: req.params.projectId }, "Project deleted successfully")); });
 export const getConversations = asyncHandler(async (req, res) => { const project = await ownedProject(req.params.projectId, req.user._id); if (!project) throw new ApiError(404, "Project not found"); return res.status(200).json(new ApiResponse(200, project.conversations, "Conversations retrieved successfully")); });
 export const createConversation = asyncHandler(async (req, res) => { const project = await ownedProject(req.params.projectId, req.user._id); if (!project) throw new ApiError(404, "Project not found"); project.conversations.push({ id: crypto.randomUUID(), projectId: project._id.toString(), title: req.body.title?.trim() || "New Conversation", messages: [] }); project.conversationCount = project.conversations.length; await project.save(); return res.status(201).json(new ApiResponse(201, project.conversations.at(-1), "Conversation created successfully")); });
-export const getConversation = asyncHandler(async (req, res) => { const { conversation: item } = await conversation(req.params.projectId, req.user._id, req.params.conversationId); return res.status(200).json(new ApiResponse(200, item, "Conversation retrieved successfully")); });
+export const getConversation = asyncHandler(async (req, res) => { const { conversation: item } = await conversation(req.params.projectId, req.user._id, req.params.conversationId); const plain = { ...item.toObject(), messages: item.messages.map(unsealMessageFromStorage) }; return res.status(200).json(new ApiResponse(200, plain, "Conversation retrieved successfully")); });
 export const updateConversation = asyncHandler(async (req, res) => { const { project, conversation: item } = await conversation(req.params.projectId, req.user._id, req.params.conversationId); item.title = req.body.title.trim(); await project.save(); return res.status(200).json(new ApiResponse(200, item, "Conversation updated successfully")); });
 export const deleteConversation = asyncHandler(async (req, res) => { const project = await ownedProject(req.params.projectId, req.user._id); if (!project) throw new ApiError(404, "Project not found"); const before = project.conversations.length; project.conversations = project.conversations.filter(c => c.id !== req.params.conversationId); if (before === project.conversations.length) throw new ApiError(404, "Conversation not found"); project.conversationCount = project.conversations.length; await project.save(); return res.status(200).json(new ApiResponse(200, {}, "Conversation deleted successfully")); });
-export const getConversationMessages = asyncHandler(async (req, res) => { const { conversation: item } = await conversation(req.params.projectId, req.user._id, req.params.conversationId); return res.status(200).json(new ApiResponse(200, { messages: item.messages }, "Messages retrieved successfully")); });
-export const sendMessage = asyncHandler(async (req, res) => { const { project, conversation: item } = await conversation(req.params.projectId, req.user._id, req.params.conversationId); const content = req.body.content?.trim(); if (!content) throw new ApiError(400, "Message content is required"); const message = { id: crypto.randomUUID(), role: req.body.role || "user", content, createdAt: new Date() }; item.messages.push(message); if (/^(New Chat|New Conversation)$/.test(item.title)) item.title = content.slice(0, 40); await project.save(); return res.status(201).json(new ApiResponse(201, message, "Message stored successfully")); });
+export const getConversationMessages = asyncHandler(async (req, res) => { const { conversation: item } = await conversation(req.params.projectId, req.user._id, req.params.conversationId); return res.status(200).json(new ApiResponse(200, { messages: item.messages.map(unsealMessageFromStorage) }, "Messages retrieved successfully")); });
+export const sendMessage = asyncHandler(async (req, res) => { const { project, conversation: item } = await conversation(req.params.projectId, req.user._id, req.params.conversationId); const content = req.body.content?.trim(); if (!content) throw new ApiError(400, "Message content is required"); const sealed = sealMessageForStorage({ id: crypto.randomUUID(), role: req.body.role || "user", content, createdAt: new Date() }); item.messages.push(sealed); if (/^(New Chat|New Conversation)$/.test(item.title)) item.title = content.slice(0, 40); await project.save(); return res.status(201).json(new ApiResponse(201, unsealMessageFromStorage(sealed), "Message stored successfully")); });
 export const uploadFile = asyncHandler(async (req, res) => { const project = await ownedProject(req.params.projectId, req.user._id); if (!project) throw new ApiError(404, "Project not found"); if (!req.file) throw new ApiError(400, "No file uploaded"); const file = { id: crypto.randomUUID(), name: req.file.originalname, size: req.file.size || 0, url: req.file.path || "", uploadedAt: new Date() }; project.files.push(file); await project.save(); return res.status(201).json(new ApiResponse(201, file, "File uploaded successfully")); });
 export const getFiles = asyncHandler(async (req, res) => { const project = await ownedProject(req.params.projectId, req.user._id); if (!project) throw new ApiError(404, "Project not found"); return res.status(200).json(new ApiResponse(200, project.files, "Files retrieved successfully")); });
+
+/**
+ * GET /:projectId/context?q=... — natural-language context search over the
+ * project's conversation history. Called back into by the MCP server's
+ * `search_project_context` tool (auth: user JWT or signed service identity).
+ * Returns a flat list of "role: content" strings the LLM can consume.
+ */
+export const getProjectContext = asyncHandler(async (req, res) => {
+  const project = await ownedProject(req.params.projectId, req.user._id);
+  if (!project) throw new ApiError(404, "Project not found");
+
+  const query = String(req.query.q || "").trim();
+  const terms = query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((term) => term.length > 1)
+    .slice(0, 12);
+
+  const scored = [];
+  for (const conv of project.conversations || []) {
+    for (const message of conv.messages || []) {
+      // Messages are AES-sealed at rest when ENCRYPTION_MODE=fhe — unseal
+      // before matching (gracefully no-ops on plain messages).
+      const content = String(unsealMessageFromStorage(message).content || "");
+      const haystack = content.toLowerCase();
+      let score = terms.filter((term) => haystack.includes(term)).length;
+      if (terms.length > 0 && score === 0) continue;
+      scored.push({ score, createdAt: message.createdAt, line: `${message.role}: ${content}` });
+    }
+  }
+
+  scored.sort(
+    (a, b) =>
+      b.score - a.score || new Date(b.createdAt) - new Date(a.createdAt),
+  );
+
+  const results = scored.slice(0, 20).map((item) => item.line);
+  return res.status(200).json(
+    new ApiResponse(200, { projectId: project._id, query, count: results.length, results }, "Project context retrieved successfully"),
+  );
+});
 export const deleteFile = asyncHandler(async (req, res) => { const project = await ownedProject(req.params.projectId, req.user._id); if (!project) throw new ApiError(404, "Project not found"); const before = project.files.length; project.files = project.files.filter(f => f.id !== req.params.fileId); if (before === project.files.length) throw new ApiError(404, "File not found"); await project.save(); return res.status(200).json(new ApiResponse(200, {}, "File deleted successfully")); });

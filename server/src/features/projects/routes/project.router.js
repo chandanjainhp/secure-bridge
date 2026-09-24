@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { verifyJWT } from "../../../middlewares/auth.middle.js";
+import { verifyJWTOrService } from "../../../middlewares/service.auth.js";
 import { validate } from "../../../middlewares/validate.js";
 import { upload } from "../../../middlewares/multer.middleware.js";
 import {
@@ -11,14 +11,15 @@ import {
   getProjects, createProject, getProject, updateProject, deleteProject,
   getConversations, createConversation, getConversation, updateConversation,
   deleteConversation, getConversationMessages, sendMessage, uploadFile,
-  getFiles, deleteFile,
+  getFiles, deleteFile, getProjectContext,
 } from "../controllers/project.controller.js";
 
 const router = Router();
-router.use(verifyJWT);
+router.use(verifyJWTOrService);
 router.get("/", getProjects);
 router.post("/", validate(createProjectSchema), createProject);
 router.get("/:projectId", validate(projectIdSchema), getProject);
+router.get("/:projectId/context", validate(projectIdSchema), getProjectContext);
 router.patch("/:projectId", validate(updateProjectSchema), updateProject);
 router.delete("/:projectId", validate(projectIdSchema), deleteProject);
 router.get("/:projectId/conversations", validate(projectIdSchema), getConversations);

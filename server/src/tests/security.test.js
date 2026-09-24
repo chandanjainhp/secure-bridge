@@ -46,7 +46,7 @@ describe("Security Tests - Phase 1", () => {
       // Check for Helmet security headers
       expect(res.headers["x-powered-by"]).toBeUndefined();
       expect(res.headers["x-content-type-options"]).toBe("nosniff");
-      expect(res.headers["x-frame-options"]).toBe("SAMEORIGIN");
+      expect(res.headers["x-frame-options"]).toBe("DENY");
       expect(res.headers["x-xss-protection"]).toBe("0");
       expect(res.headers["content-security-policy"]).toBeDefined();
     });
@@ -57,16 +57,16 @@ describe("Security Tests - Phase 1", () => {
   // ============================================================
   describe("CORS Configuration", () => {
     it("should reject requests from non-allowlisted origins", async () => {
-      // This test is tricky because supertest doesn't simulate CORS preflight
-      // We can test by setting Origin header and checking response
+      // Unknown origins get a clean 403 from the origin-gate middleware —
+      // and no Access-Control-Allow-Origin header, so browsers block the
+      // response (AC-SEC-1).
       const res = await request(app)
         .get("/health")
         .set("Origin", "https://evil.com")
-        .expect(200);
+        .expect(403);
 
-      // In production with proper CORS, the browser would block this
-      // For now, we verify that CORS headers are present
-      expect(res.headers["access-control-allow-origin"]).toBeDefined();
+      expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+      expect(res.body.message).toBe("Origin is not allowed");
     });
 
     it("should allow CORS preflight requests from configured origins", async () => {

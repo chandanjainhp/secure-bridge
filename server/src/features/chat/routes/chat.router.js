@@ -33,5 +33,11 @@ router.get(
   ChatController.getModels,
 );
 
+router.get(
+  "/tools",
+  verifyJWTOrApiKey("chat.access"),
+  ChatController.getTools,
+);
+
 
 export default router;

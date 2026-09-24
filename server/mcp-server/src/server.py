@@ -19,6 +19,7 @@ from fastmcp import FastMCP
 
 from . import config
 from .allowlist import AllowlistError
+from .app import mcp  # the single shared FastMCP instance (see app.py)
 
 log = logging.getLogger("mcp.server")
 logging.basicConfig(
@@ -26,16 +27,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-# Create the FastMCP app. mask_error_details=True ensures internal stack traces
-# and file paths are never leaked back to the LLM/client on unexpected errors.
-mcp = FastMCP(
-    name="secure-bridge",
-    instructions=(
-        "Secure Bridge MCP server. Tools enforce the project outbound "
-        "allowlist; non-allowlisted hosts are rejected."
-    ),
-    mask_error_details=True,
-)
+# (The FastMCP app itself now lives in src/app.py — see the note there —
+# so tool modules and this entrypoint always share one instance.)
 
 
 def register_tools() -> None:

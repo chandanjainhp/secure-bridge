@@ -20,14 +20,14 @@ dev = [
 ]
 
 [project.scripts]
-secure-bridge-mcp = "server:main"
+secure-bridge-mcp = "src.server:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["server", "server.tools"]
+packages = ["src", "src.tools"]
 
 [tool.setuptools.package-dir]
 server = "src"

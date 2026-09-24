@@ -1,9 +1,10 @@
-import { generateText, streamText } from "ai";
+import { generateText, streamText, stepCountIs } from "ai";
 import { ApiError } from "../../../utils/ApiError.js";
 import { ApiResponse } from "../../../utils/ApiResponse.js";
 import { asyncHandler } from "../../../utils/asyncHandler.js";
 import { ApiKey } from "../../../features/api-key/models/apikey.model.js";
 import usageService from "../../usage/services/usageService.js";
+import { getMcpToolsForAiSdk } from "../../../services/mcpClient.js";
 import {
   getModelInstance,
   detectProvider,
@@ -15,12 +16,21 @@ import {
   MODEL_CATALOGS,
   FALLBACK_CHAIN,
 } from "../../../utils/chat.providers.js";
+import {
+  fheChatActive,
+  selectContextWithFhe,
+} from "../../../services/fheChat.js";
 
 // ============================================================
 // HELPER: Build OpenAI-compatible response from AI SDK result
 // ============================================================
 
-function buildCompletionResponse(result, model, providerUsed, message = "Chat completion successful") {
+function buildCompletionResponse(
+  result,
+  model,
+  providerUsed,
+  message = "Chat completion successful",
+) {
   return new ApiResponse(
     200,
     {
@@ -42,8 +52,129 @@ function buildCompletionResponse(result, model, providerUsed, message = "Chat co
         total_tokens: result.usage?.totalTokens || 0,
       },
     },
-    message
+    message,
   );
+}
+
+// ============================================================
+// HELPER: Collect MCP tool calls from an AI SDK result
+// ============================================================
+
+function collectToolCalls(result) {
+  const calls = [];
+  for (const step of result.steps || []) {
+    for (const toolCall of step.toolCalls || []) {
+      calls.push({
+        tool: toolCall.toolName,
+        input: toolCall.input,
+      });
+    }
+  }
+  return calls;
+}
+
+// ============================================================
+// PROMPT-PROTOCOL TOOL CALLING (local models)
+//
+// LM Studio's OpenAI-compatible endpoint does not parse tool-call syntax
+// for most local models — native `tools` leak back as plain text and the
+// AI SDK never sees a tool call. For the local provider we instead declare
+// the tools in the system prompt with an explicit `TOOL_CALL: {...}` output
+// convention, parse the model's line, execute via MCP, and feed the result
+// back — a bounded agent loop that works with ANY local model.
+// ============================================================
+
+const TOOL_CALL_RE = /TOOL_CALL:\s*(\{[\s\S]*?\})\s*$/;
+
+function buildToolProtocolPrompt(mcpTools) {
+  const toolDocs = Object.entries(mcpTools)
+    .map(([name, tool]) => {
+      const schema = tool.inputSchema || {};
+      const props = Object.keys(schema.properties || {});
+      return `- ${name}: ${tool.description || ""} (args: ${props.join(", ") || "none"})`;
+    })
+    .join("\n");
+
+  return [
+    "You can use these tools:",
+    toolDocs,
+    "",
+    "To call a tool, END your reply with exactly one line in this format:",
+    'TOOL_CALL: {"tool": "<tool name>", "args": { ... }}',
+    "",
+    "After a TOOL_CALL line the system executes the tool and replies with a TOOL_RESULT message. ",
+    "Then produce your final answer. The final answer must NOT contain a TOOL_CALL line.",
+    "If you do not need a tool, just answer directly.",
+  ].join("\n");
+}
+
+async function runLocalToolLoop({ model, promptOptions, mcpTools, maxRounds = 3 }) {
+  const baseMessages = [...(promptOptions.messages || [])];
+  const systemText = buildToolProtocolPrompt(mcpTools);
+  // AI SDK v7: system prompts belong in the `system` option, never inside
+  // `messages` (a system-role message there throws InvalidPrompt).
+  const mergedSystem = promptOptions.system
+    ? `${promptOptions.system}\n\n${systemText}`
+    : systemText;
+  let convo = baseMessages;
+
+  const toolCalls = [];
+  let result;
+
+  for (let round = 0; round < maxRounds; round += 1) {
+    result = await generateText({
+      ...promptOptions,
+      messages: convo,
+      system: mergedSystem,
+      abortSignal: AbortSignal.timeout(120_000),
+    });
+
+    const text = result.text || "";
+    const match = text.trimEnd().match(TOOL_CALL_RE);
+    if (!match) return { result, toolCalls }; // final answer reached
+
+    let parsed;
+    try {
+      parsed = JSON.parse(match[1]);
+    } catch {
+      return { result, toolCalls }; // malformed call — return as-is
+    }
+
+    const toolName = parsed.tool || parsed.name;
+    const tool = toolName ? mcpTools[toolName] : null;
+    if (!tool) return { result, toolCalls };
+
+    let toolOutput;
+    try {
+      toolOutput = await tool.execute(parsed.args || {});
+    } catch (error) {
+      toolOutput = `Tool error: ${error?.message || error}`;
+    }
+
+    toolCalls.push({ tool: toolName, input: parsed.args || {} });
+    convo = [
+      ...convo,
+      { role: "assistant", content: text },
+      {
+        role: "user",
+        content:
+          `TOOL_RESULT for ${toolName}:\n${String(toolOutput).slice(0, 4000)}\n\n` +
+          "Use this result. If you need another tool, end your reply with one TOOL_CALL line; otherwise write the final answer with NO TOOL_CALL line.",
+      },
+    ];
+  }
+
+  // Round budget exhausted — one final forced answer.
+  result = await generateText({
+    ...promptOptions,
+    messages: [
+      ...convo,
+      { role: "user", content: "No more tool calls. Write your final answer now." },
+    ],
+    system: mergedSystem,
+    abortSignal: AbortSignal.timeout(120_000),
+  });
+  return { result, toolCalls };
 }
 
 // ============================================================
@@ -51,37 +182,129 @@ function buildCompletionResponse(result, model, providerUsed, message = "Chat co
 // ============================================================
 
 async function executeCompletion(res, model, messages, params) {
-  const { temperature, max_tokens, stream, top_p, stop, model: modelName, providerUsed, userId, trackUsage = true } = params;
+  const {
+    temperature,
+    max_tokens,
+    stream,
+    top_p,
+    stop,
+    model: modelName,
+    providerUsed,
+    userId,
+    trackUsage = true,
+    mcpTools,
+    localToolLoop = false,
+  } = params;
 
-  if (stream) {
-    const result = streamText({
-      model,
-      messages,
-      temperature,
-      maxTokens: max_tokens,
-      topP: top_p,
-      stopSequences: stop,
-    });
-    return result.toDataStreamResponse(res);
-  }
-
-  const result = await generateText({
+  const systemMessages = messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content)
+    .filter(Boolean);
+  const modelMessages = messages.filter((message) => message.role !== "system");
+  const promptOptions = {
     model,
-    messages,
+    messages: modelMessages,
+    ...(systemMessages.length > 0
+      ? { system: systemMessages.join("\n\n") }
+      : {}),
     temperature,
     maxTokens: max_tokens,
     topP: top_p,
     stopSequences: stop,
-  });
-  if (trackUsage && userId) await usageService.recordTokens(userId, {
-    promptTokens: result.usage?.inputTokens || result.usage?.promptTokens || 0,
-    completionTokens: result.usage?.outputTokens || result.usage?.completionTokens || 0,
-    totalTokens: result.usage?.totalTokens || 0,
-  });
+  };
 
-  return res
-    .status(200)
-    .json(buildCompletionResponse(result, modelName, providerUsed));
+  const completionOptions = {
+    ...promptOptions,
+    abortSignal: AbortSignal.timeout(120_000), // fail fast instead of hanging when the LLM server is unreachable/stuck
+  };
+
+  // Local models: prompt-protocol loop instead of native tools (LM Studio
+  // does not parse tool-call syntax for most local models).
+  if (localToolLoop && mcpTools && Object.keys(mcpTools).length > 0 && !stream) {
+    const loop = await runLocalToolLoop({ model, promptOptions, mcpTools });
+    const toolCalls = loop.toolCalls;
+    if (toolCalls.length > 0) {
+      console.log(`🔧 MCP tool calls (local loop): ${toolCalls.map((c) => c.tool).join(", ")}`);
+    }
+    if (trackUsage && userId) {
+      usageService
+        .recordTokens(userId, {
+          promptTokens: loop.result.usage?.inputTokens || loop.result.usage?.promptTokens || 0,
+          completionTokens: loop.result.usage?.outputTokens || loop.result.usage?.completionTokens || 0,
+          totalTokens: loop.result.usage?.totalTokens || 0,
+        })
+        .catch(() => {});
+    }
+    const payload = buildCompletionResponse(loop.result, modelName, providerUsed);
+    if (toolCalls.length > 0) {
+      payload.data.mcp = { toolCalls };
+    }
+    return res.status(200).json(payload);
+  }
+
+  // Attach MCP tools (ENABLE_MCP=true) so the model can call them mid-answer.
+  // stopWhen caps the agent loop; tool failures are returned to the model as
+  // readable errors (see mcpClient.execute) so one bad call can't kill the
+  // whole completion.
+  if (mcpTools && Object.keys(mcpTools).length > 0 && !localToolLoop) {
+    completionOptions.tools = mcpTools;
+    completionOptions.stopWhen = stepCountIs(5);
+  }
+
+  if (stream) {
+    if (completionOptions.tools) {
+      res.setHeader("x-mcp-tools", `attached=${Object.keys(completionOptions.tools).join(",")}`);
+    }
+    const result = streamText(completionOptions);
+    return result.toDataStreamResponse(res);
+  }
+
+  let result;
+  try {
+    result = await generateText(completionOptions);
+  } catch (error) {
+    // Retry without tools: a broken MCP server / bad tool loop must not take
+    // down the chat itself.
+    if (!completionOptions.tools) throw error;
+    console.warn(
+      "⚠️  Completion with MCP tools failed; retrying without tools:",
+      error?.message || error,
+    );
+    result = await generateText({
+      ...promptOptions,
+      abortSignal: completionOptions.abortSignal,
+    });
+  }
+
+  const toolCalls = collectToolCalls(result);
+  if (toolCalls.length > 0) {
+    console.log(
+      `🔧 MCP tool calls: ${toolCalls.map((c) => c.tool).join(", ")}`,
+    );
+  }
+  if (trackUsage && userId) {
+    usageService
+      .recordTokens(userId, {
+        promptTokens:
+          result.usage?.inputTokens || result.usage?.promptTokens || 0,
+        completionTokens:
+          result.usage?.outputTokens || result.usage?.completionTokens || 0,
+        totalTokens: result.usage?.totalTokens || 0,
+      })
+      .catch((error) => {
+        console.error("Chat usage recording failed", {
+          name: error?.name,
+          message: error?.message,
+        });
+      });
+  }
+
+  const payload = buildCompletionResponse(result, modelName, providerUsed);
+  if (toolCalls.length > 0) {
+    payload.data.mcp = { toolCalls };
+  }
+
+  return res.status(200).json(payload);
 }
 
 // ============================================================
@@ -95,7 +318,13 @@ class ChatController {
   static test = asyncHandler(async (req, res) => {
     return res
       .status(200)
-      .json(new ApiResponse(200, { timestamp: new Date() }, "Chat router is working!"));
+      .json(
+        new ApiResponse(
+          200,
+          { timestamp: new Date() },
+          "Chat router is working!",
+        ),
+      );
   });
 
   // ---------------------------------------------------------
@@ -112,14 +341,58 @@ class ChatController {
     // Determine provider and model
     const { provider: selectedProvider, model: selectedModel } = detectProvider(
       req.body.model,
-      requestedProvider
+      requestedProvider,
     );
 
     console.log(
-      `🤖 Chat request: provider=${selectedProvider}, model=${selectedModel}, messages=${messages.length}, stream=${stream}`
+      `🤖 Chat request: provider=${selectedProvider}, model=${selectedModel}, messages=${messages.length}, stream=${stream}`,
     );
 
-    const params = { temperature, max_tokens, stream, top_p, stop };
+    // MCP tools are attached per request (ENABLE_MCP=true + reachable MCP
+    // server). Discovery failures degrade to toolless chat, never an error.
+    const { tools: mcpTools, error: mcpError } = await getMcpToolsForAiSdk(
+      userId,
+    );
+    if (mcpError) {
+      console.warn("⚠️  MCP tool discovery failed:", mcpError);
+    }
+
+    const params = { temperature, max_tokens, stream, top_p, stop, mcpTools };
+
+    // --- FHE homomorphic context retrieval (ENCRYPTION_MODE=fhe) ---
+    // History turns are ranked against the current message with real BFV
+    // ciphertext math (word-bucket vectors); only scalar scores are decrypted.
+    // In mock mode this is a no-op passthrough.
+    let effectiveMessages = messages;
+    if (
+      fheChatActive() &&
+      Array.isArray(messages) &&
+      messages.length > 2
+    ) {
+      const systemParts = messages.filter((m) => m.role === "system");
+      const history = messages.slice(0, -1).filter((m) => m.role !== "system");
+      const currentMessage = messages[messages.length - 1]?.content || "";
+      // Cap the scoring window so latency stays bounded on long histories.
+      const result = await selectContextWithFhe(
+        history.slice(-30),
+        currentMessage,
+        { maxTurns: 8 },
+      );
+      effectiveMessages = [
+        ...systemParts,
+        ...result.messages,
+        messages[messages.length - 1],
+      ].filter(Boolean);
+      if (result.fhe.enabled && !res.headersSent) {
+        res.setHeader(
+          "x-fhe-retrieval",
+          `scored=${result.fhe.scoredTurns}; selected=${result.fhe.selectedTurns}; top=${result.fhe.topScore}; scheme=BFV; on-ciphertext=true`,
+        );
+      }
+      console.log(
+        `🔐 FHE retrieval: enabled=${result.fhe.enabled}${result.fhe.enabled ? ` scored=${result.fhe.scoredTurns} selected=${result.fhe.selectedTurns} top=${result.fhe.topScore} in ${result.fhe.durationMs}ms` : ` reason=${result.fhe.reason}`}`,
+      );
+    }
 
     // --- Local path (with external fallback) ---
     if (selectedProvider === "local") {
@@ -127,14 +400,15 @@ class ChatController {
         const { model, providerUsed } = await getModelInstance(
           "local",
           selectedModel,
-          userId
+          userId,
         );
 
-        return await executeCompletion(res, model, messages, {
+        return await executeCompletion(res, model, effectiveMessages, {
           ...params,
           modelName: selectedModel,
           providerUsed,
           userId,
+          localToolLoop: true,
         });
       } catch (localError) {
         console.log("⚠️  Local LLM not available:", localError.message);
@@ -144,8 +418,8 @@ class ChatController {
         const fallbackSent = await ChatController._tryExternalFallback(
           res,
           userId,
-          messages,
-          params
+          effectiveMessages,
+          params,
         );
 
         if (fallbackSent) {
@@ -154,25 +428,49 @@ class ChatController {
 
         throw new ApiError(
           503,
-          "Local LLM server not available and no external API keys configured",
-          { localError: localError.message, fallbackAttempted: true }
+          "Local LLM server is unreachable (is LM Studio / Ollama running?) and no external API keys are configured as fallback",
+          { localError: localError.message, fallbackAttempted: true },
         );
       }
     }
 
     // --- External provider path ---
-    const instance = await getModelInstance(selectedProvider, selectedModel, userId);
+    let instance = await getModelInstance(
+      selectedProvider,
+      selectedModel,
+      userId,
+    );
 
     if (!instance) {
+      // Existing projects may still contain a cloud model selected before a
+      // local connection was configured. Use the user's local profile only
+      // when the requested cloud provider has no usable key.
+      instance = await getModelInstance(
+        "local",
+        "local",
+        userId,
+        null,
+        false,
+      ).catch(() => null);
+      if (instance) {
+        return await executeCompletion(res, instance.model, effectiveMessages, {
+          ...params,
+          modelName: "local",
+          providerUsed: instance.providerUsed,
+          userId,
+          localToolLoop: true,
+        });
+      }
+
       throw new ApiError(
         502,
-        `No API key found for provider "${selectedProvider}". Ensure you have an active API key with chat permissions.`
+        `No API key found for provider "${selectedProvider}", and no local LLM connection is available. Configure a provider key or select a configured local model.`,
       );
     }
 
     const { model, providerUsed } = instance;
 
-    return await executeCompletion(res, model, messages, {
+    return await executeCompletion(res, model, effectiveMessages, {
       ...params,
       modelName: selectedModel,
       providerUsed,
@@ -190,12 +488,19 @@ class ChatController {
       local: { available: false, reason: "Local LLM server offline" },
       google: { available: false, reason: "No Google API key configured" },
       openai: { available: false, reason: "No OpenAI API key configured" },
-      anthropic: { available: false, reason: "No Anthropic API key configured" },
-      azure: { available: false, reason: "Azure provider is not available through the active AI SDK provider registry" },
+      anthropic: {
+        available: false,
+        reason: "No Anthropic API key configured",
+      },
+      azure: {
+        available: false,
+        reason:
+          "Azure provider is not available through the active AI SDK provider registry",
+      },
     };
 
     // Check local LLM
-    const localHealthy = await checkLocalLLMHealth();
+    const localHealthy = await checkLocalLLMHealth(userId);
     if (localHealthy) {
       providers.local = { available: true, status: "connected" };
     }
@@ -210,7 +515,9 @@ class ChatController {
 
       const matchKey = (keyword) =>
         userApiKeys.find((key) =>
-          (key.provider || key.externalProvider || "").toLowerCase().includes(keyword)
+          (key.provider || key.externalProvider || "")
+            .toLowerCase()
+            .includes(keyword),
         );
 
       const googleKey = matchKey("google");
@@ -244,7 +551,9 @@ class ChatController {
       }
     }
 
-    const availableCount = Object.values(providers).filter((p) => p.available).length;
+    const availableCount = Object.values(providers).filter(
+      (p) => p.available,
+    ).length;
 
     return res.status(200).json(
       new ApiResponse(
@@ -254,8 +563,10 @@ class ChatController {
           totalProviders: Object.keys(providers).length,
           availableProviders: availableCount,
         },
-        availableCount > 0 ? "Chat providers available" : "No chat providers available"
-      )
+        availableCount > 0
+          ? "Chat providers available"
+          : "No chat providers available",
+      ),
     );
   });
 
@@ -271,7 +582,7 @@ class ChatController {
     // Local models
     if (provider === "all" || provider === "local") {
       try {
-        const localModels = await getLocalModels();
+        const localModels = await getLocalModels(userId);
         models.local = { available: true, models: localModels };
       } catch (error) {
         models.local = { available: false, error: error.message, models: [] };
@@ -281,7 +592,8 @@ class ChatController {
     // External models (only show if user has active keys)
     if (
       userId &&
-      (provider === "all" || ["google", "openai", "anthropic"].includes(provider))
+      (provider === "all" ||
+        ["google", "openai", "anthropic"].includes(provider))
     ) {
       const userApiKeys = await ApiKey.find({
         userId,
@@ -291,12 +603,19 @@ class ChatController {
 
       const hasProvider = (keyword) =>
         userApiKeys.some((key) =>
-          (key.provider || key.externalProvider || "").toLowerCase().includes(keyword)
+          (key.provider || key.externalProvider || "")
+            .toLowerCase()
+            .includes(keyword),
         );
 
-      if (hasProvider("google") && (provider === "all" || provider === "google")) {
+      if (
+        hasProvider("google") &&
+        (provider === "all" || provider === "google")
+      ) {
         const googleKeys = userApiKeys.filter((key) =>
-          (key.provider || key.externalProvider || "").toLowerCase().includes("google")
+          (key.provider || key.externalProvider || "")
+            .toLowerCase()
+            .includes("google"),
         );
         models.google = {
           available: true,
@@ -305,9 +624,14 @@ class ChatController {
         };
       }
 
-      if (hasProvider("openai") && (provider === "all" || provider === "openai")) {
+      if (
+        hasProvider("openai") &&
+        (provider === "all" || provider === "openai")
+      ) {
         const openaiKeys = userApiKeys.filter((key) =>
-          (key.provider || key.externalProvider || "").toLowerCase().includes("openai")
+          (key.provider || key.externalProvider || "")
+            .toLowerCase()
+            .includes("openai"),
         );
         models.openai = {
           available: true,
@@ -316,9 +640,14 @@ class ChatController {
         };
       }
 
-      if (hasProvider("anthropic") && (provider === "all" || provider === "anthropic")) {
+      if (
+        hasProvider("anthropic") &&
+        (provider === "all" || provider === "anthropic")
+      ) {
         const anthropicKeys = userApiKeys.filter((key) =>
-          (key.provider || key.externalProvider || "").toLowerCase().includes("anthropic")
+          (key.provider || key.externalProvider || "")
+            .toLowerCase()
+            .includes("anthropic"),
         );
         models.anthropic = {
           available: true,
@@ -344,8 +673,34 @@ class ChatController {
           providers: models,
           providerRequested: provider,
         },
-        "Models retrieved successfully"
-      )
+        "Models retrieved successfully",
+      ),
+    );
+  });
+
+  // ---------------------------------------------------------
+  // GET /tools — MCP tool visibility (JWT or API key required)
+  // ---------------------------------------------------------
+  static getTools = asyncHandler(async (req, res) => {
+    const userId = req.user?._id || req.apiKey?.userId;
+    const { tools, error } = await getMcpToolsForAiSdk(userId);
+
+    return res.status(200).json(
+      new ApiResponse(
+        200,
+        {
+          enabled: process.env.ENABLE_MCP === "true",
+          serverUrl:
+            process.env.MCP_SERVER_URL ||
+            `http://${process.env.MCP_SERVER_HOST || "127.0.0.1"}:${process.env.MCP_SERVER_PORT || "8787"}/mcp`,
+          discoveryError: error,
+          tools: Object.entries(tools).map(([name, tool]) => ({
+            name,
+            description: tool.description,
+          })),
+        },
+        "MCP tools retrieved successfully",
+      ),
     );
   });
 
@@ -364,8 +719,8 @@ class ChatController {
             url: LLM_SERVER_URL,
           },
         },
-        "LLM server health check completed"
-      )
+        "LLM server health check completed",
+      ),
     );
   });
 
@@ -386,8 +741,8 @@ class ChatController {
             providers: "/api/v1/chat/providers (requires API key)",
           },
         },
-        "Backend server is working! This endpoint does not require authentication."
-      )
+        "Backend server is working! This endpoint does not require authentication.",
+      ),
     );
   });
 
@@ -404,7 +759,11 @@ class ChatController {
     ];
 
     try {
-      const { model } = await getModelInstance("local", DEFAULT_MODELS.local, null);
+      const { model } = await getModelInstance(
+        "local",
+        DEFAULT_MODELS.local,
+        null,
+      );
 
       const result = await generateText({
         model,
@@ -420,8 +779,8 @@ class ChatController {
             response: result.text || "No response content",
             provider: "local",
           },
-          "Local LLM is working!"
-        )
+          "Local LLM is working!",
+        ),
       );
     } catch (error) {
       throw new ApiError(503, "Local LLM test failed", {
@@ -451,7 +810,12 @@ class ChatController {
       keyPrefix,
       hashedKey,
       isExternal: false,
-      permissions: ["chat.access", "chat.completions", "fhe.encrypt", "mcp.connect"],
+      permissions: [
+        "chat.access",
+        "chat.completions",
+        "fhe.encrypt",
+        "mcp.connect",
+      ],
       rateLimit: {
         requestsPerMinute: 100,
         requestsPerHour: 1000,
@@ -470,10 +834,11 @@ class ChatController {
           name: apiKey.name,
           permissions: apiKey.permissions,
           status: apiKey.status,
-          usage: "Include this key in X-API-Key header for authenticated requests",
+          usage:
+            "Include this key in X-API-Key header for authenticated requests",
         },
-        "Demo API key created successfully!"
-      )
+        "Demo API key created successfully!",
+      ),
     );
   });
 
@@ -513,8 +878,8 @@ class ChatController {
             lastUsed: demoKey.usage?.lastUsed || null,
           },
         },
-        "Demo API key retrieved successfully!"
-      )
+        "Demo API key retrieved successfully!",
+      ),
     );
   });
 
@@ -533,7 +898,7 @@ class ChatController {
    * @returns {boolean} true if a response was sent, false if no fallback available
    */
   static async _tryExternalFallback(res, userId, messages, params) {
-    const { temperature, max_tokens, stream, top_p, stop } = params;
+    const { temperature, max_tokens, stream, top_p, stop, mcpTools } = params;
 
     try {
       const externalKeys = await findExternalKeys(userId);
@@ -544,7 +909,11 @@ class ChatController {
 
       for (const entry of FALLBACK_CHAIN) {
         const keyDoc = externalKeys.find((k) => {
-          const provider = (k.provider || k.externalProvider || "").toLowerCase();
+          const provider = (
+            k.provider ||
+            k.externalProvider ||
+            ""
+          ).toLowerCase();
           return provider.includes(entry.matchKeyword);
         });
 
@@ -560,7 +929,7 @@ class ChatController {
           sdkProvider,
           entry.model,
           userId,
-          keyDoc
+          keyDoc,
         );
 
         if (!instance) continue;
@@ -574,6 +943,7 @@ class ChatController {
           stream,
           top_p,
           stop,
+          mcpTools,
           modelName: entry.model,
           providerUsed,
           userId,

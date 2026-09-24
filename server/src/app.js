@@ -34,13 +34,18 @@ const corsOptions = {
       return;
     }
 
-    callback(new Error("Origin is not allowed"));
+    // Disallowed origins: pass `false` so the cors middleware simply omits
+    // the Access-Control-Allow-Origin headers instead of throwing (which
+    // surfaced as a 500). The origin-gate middleware below then answers the
+    // request with a clean 403 JSON response.
+    callback(null, false);
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: [
     "Content-Type",
     "Authorization",
+    "X-Provider",
     "X-Requested-With",
     "Accept",
   ],
@@ -63,13 +68,11 @@ app.use((req, res, next) => {
     return res.sendStatus(204);
   }
   if (!origin || allowedOrigins.includes(origin)) return next();
-  return res
-    .status(403)
-    .json({
-      success: false,
-      statusCode: 403,
-      message: "Origin is not allowed",
-    });
+  return res.status(403).json({
+    success: false,
+    statusCode: 403,
+    message: "Origin is not allowed",
+  });
 });
 
 // ------------------------------------------------------------

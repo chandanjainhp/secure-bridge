@@ -52,6 +52,7 @@ export const rateLimiters = {
   general: rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 100, // Limit each IP to 100 requests per windowMs
+    skip: (req) => process.env.NODE_ENV === "development", // dev bypass: the SPA polls aggressively
     message: {
       error: "Too many requests from this IP, please try again later.",
       retryAfter: "15 minutes"
@@ -67,6 +68,7 @@ export const rateLimiters = {
   auth: rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 5, // Limit each IP to 5 login attempts per windowMs
+    skip: (req) => process.env.NODE_ENV === "development", // dev bypass: local testing shouldn't get locked out
     message: {
       error: "Too many authentication attempts from this IP, please try again later.",
       retryAfter: "15 minutes"
@@ -78,9 +80,17 @@ export const rateLimiters = {
   }),
 
   // API key creation (moderate)
+  // Only count mutations (POST/PATCH/PUT/DELETE). The frontend polls GET /api-key
+  // frequently, and reads must never consume the creation budget.
   createApiKey: rateLimit({
     windowMs: 60 * 60 * 1000, // 1 hour
     max: 20, // Limit each IP to 20 API key creations per hour
+    skip: (req) =>
+      process.env.NODE_ENV === "development" || // dev bypass: local testing
+      !/[A-Z]+/.test(req.method) ||
+      req.method === "GET" ||
+      req.method === "HEAD" ||
+      req.method === "OPTIONS",
     message: {
       error: "Too many API keys created from this IP, please try again later.",
       retryAfter: "1 hour"
@@ -91,9 +101,16 @@ export const rateLimiters = {
   }),
 
   // API key testing (moderate)
+  // Only count mutations — the frontend polls GET /api-key and must not burn
+  // this budget (mount is path-wide via app.use).
   testApiKey: rateLimit({
     windowMs: 5 * 60 * 1000, // 5 minutes
     max: 30, // Limit each IP to 30 tests per 5 minutes
+    skip: (req) =>
+      process.env.NODE_ENV === "development" || // dev bypass: local testing
+      req.method === "GET" ||
+      req.method === "HEAD" ||
+      req.method === "OPTIONS",
     message: {
       error: "Too many API key tests from this IP, please try again later.",
       retryAfter: "5 minutes"

@@ -12,6 +12,7 @@
 import { ApiKey } from "../models/apikey.model.js";
 import { ApiError } from "../../../utils/ApiError.js";
 import crypto from "crypto";
+import { assertLocalLlmHost } from "../../../utils/localLlm.js";
 
 const isDev = process.env.NODE_ENV === "development";
 
@@ -35,8 +36,29 @@ class ApiKeyService {
         settings = {},
       } = keyData;
 
+      if (provider === "local") {
+        if (externalKey && externalKey.trim().length > 500) {
+          throw new ApiError(400, "Local LLM token is too long");
+        }
+        const localLlm = settings.localLlm;
+        if (!localLlm?.baseUrl || !localLlm?.model) {
+          throw new ApiError(400, "Local LLM base URL and model are required");
+        }
+        try {
+          localLlm.baseUrl = await assertLocalLlmHost(localLlm.baseUrl);
+        } catch {
+          throw new ApiError(
+            400,
+            "Local LLM URL must resolve to a private or loopback address",
+          );
+        }
+      }
+
       if (!name || name.trim().length < 3) {
-        throw new ApiError(400, "API key name must be at least 3 characters long");
+        throw new ApiError(
+          400,
+          "API key name must be at least 3 characters long",
+        );
       }
 
       // Check for duplicate names
@@ -70,14 +92,51 @@ class ApiKeyService {
       // EXTERNAL KEY
       // ============================================================
 
-      if (externalKey && provider) {
-        const validation = ApiKey.validateExternalKeyFormat(externalKey, provider);
+      if (provider === "local") {
+        const keyGeneration = ApiKey.generateKey();
+        const localLlm = settings.localLlm;
+        const localData = {
+          ...apiKeyData,
+          isExternal: true,
+          externalProvider: "local",
+          provider: "local",
+          key: `local-${keyGeneration.key.slice(-32)}`,
+          keyPrefix: "local",
+          hashedKey: keyGeneration.hashedKey,
+          settings: {
+            ...settings,
+            localLlm: {
+              ...localLlm,
+              enabled: localLlm.enabled !== false,
+            },
+          },
+        };
+
+        if (externalKey?.trim()) {
+          const encryptionResult = ApiKey.encryptExternalKey(
+            externalKey.trim(),
+          );
+          Object.assign(localData, {
+            externalKeyEncrypted: encryptionResult.encrypted,
+            encryptionIV: encryptionResult.iv,
+            encryptionTag: encryptionResult.tag,
+          });
+        }
+        apiKeyData = localData;
+      } else if (externalKey && provider) {
+        const validation = ApiKey.validateExternalKeyFormat(
+          externalKey,
+          provider,
+        );
         if (!validation.valid) {
           throw new ApiError(400, validation.message);
         }
 
         const maskedKey = ApiKeyService._maskExternalKey(externalKey, provider);
-        const externalKeyHash = crypto.createHash("sha256").update(externalKey).digest("hex");
+        const externalKeyHash = crypto
+          .createHash("sha256")
+          .update(externalKey)
+          .digest("hex");
 
         // Detect exact duplicate external secrets without storing plaintext.
         const maskedKeyDuplicate = await ApiKey.findOne({
@@ -93,7 +152,8 @@ class ApiKeyService {
               maskedKeyDuplicate.status = "active";
               maskedKeyDuplicate.permissions =
                 permissions || maskedKeyDuplicate.permissions;
-              maskedKeyDuplicate.rateLimit = rateLimit || maskedKeyDuplicate.rateLimit;
+              maskedKeyDuplicate.rateLimit =
+                rateLimit || maskedKeyDuplicate.rateLimit;
               maskedKeyDuplicate.updatedAt = new Date();
               maskedKeyDuplicate.lastUsed = new Date();
 
@@ -107,13 +167,13 @@ class ApiKeyService {
             } else {
               throw new ApiError(
                 400,
-                "This API key is already active in your account. Please check your existing API keys."
+                "This API key is already active in your account. Please check your existing API keys.",
               );
             }
           } else {
             throw new ApiError(
               400,
-              "This external API key is already registered by another user"
+              "This external API key is already registered by another user",
             );
           }
         }
@@ -139,10 +199,10 @@ class ApiKeyService {
         // ============================================================
 
         const keyGeneration = ApiKey.generateKey();
-        
+
         // Encrypt the internal key for storage
         const encryptionResult = ApiKey.encryptExternalKey(keyGeneration.key);
-        
+
         apiKeyData = {
           ...apiKeyData,
           ...keyGeneration,
@@ -152,7 +212,7 @@ class ApiKeyService {
           encryptionIV: encryptionResult.iv,
           encryptionTag: encryptionResult.tag,
           // Store masked key for display
-          key: ApiKeyService._maskExternalKey(keyGeneration.key, 'internal'),
+          key: ApiKeyService._maskExternalKey(keyGeneration.key, "internal"),
         };
       }
 
@@ -179,6 +239,21 @@ class ApiKeyService {
       return response;
     } catch (error) {
       if (error instanceof ApiError) throw error;
+      if (error?.name === "ValidationError") {
+        throw new ApiError(400, "API key data failed validation");
+      }
+      if (error?.code === 11000) {
+        throw new ApiError(
+          409,
+          "An API key with the same unique value already exists",
+        );
+      }
+      if (isDev) {
+        console.error("API key creation failed", {
+          name: error?.name,
+          message: error?.message,
+        });
+      }
       throw new ApiError(500, "Failed to create API key");
     }
   }
@@ -219,7 +294,9 @@ class ApiKeyService {
       const skip = (page - 1) * limit;
       const [apiKeys, total] = await Promise.all([
         ApiKey.find(filter)
-          .select("-hashedKey -externalKeyEncrypted -encryptionIV -encryptionTag -key")
+          .select(
+            "-hashedKey -externalKeyEncrypted -encryptionIV -encryptionTag -key",
+          )
           .sort(sort)
           .skip(skip)
           .limit(limit)
@@ -259,7 +336,9 @@ class ApiKeyService {
       const apiKey = await ApiKey.findOne({
         _id: keyId,
         userId,
-      }).select("-hashedKey -externalKeyEncrypted -encryptionIV -encryptionTag -key");
+      }).select(
+        "-hashedKey -externalKeyEncrypted -encryptionIV -encryptionTag -key",
+      );
 
       if (!apiKey) {
         throw new ApiError(404, "API key not found");
@@ -291,6 +370,43 @@ class ApiKeyService {
 
       if (!apiKey) {
         throw new ApiError(404, "API key not found");
+      }
+
+      if (updateData.externalKey !== undefined) {
+        if (
+          !apiKey.isExternal ||
+          !apiKey.externalProvider ||
+          apiKey.externalProvider === "local"
+        ) {
+          throw new ApiError(
+            400,
+            "This API key does not accept an external provider key",
+          );
+        }
+
+        const validation = ApiKey.validateExternalKeyFormat(
+          updateData.externalKey,
+          apiKey.externalProvider,
+        );
+        if (!validation.valid) {
+          throw new ApiError(400, validation.message);
+        }
+
+        const encryptionResult = ApiKey.encryptExternalKey(
+          updateData.externalKey,
+        );
+        apiKey.externalKeyEncrypted = encryptionResult.encrypted;
+        apiKey.encryptionIV = encryptionResult.iv;
+        apiKey.encryptionTag = encryptionResult.tag;
+        apiKey.hashedKey = crypto
+          .createHash("sha256")
+          .update(updateData.externalKey)
+          .digest("hex");
+        apiKey.key = ApiKeyService._maskExternalKey(
+          updateData.externalKey,
+          apiKey.externalProvider,
+        );
+        apiKey.keyPrefix = `${apiKey.externalProvider.substring(0, 4)}-****${updateData.externalKey.slice(-4)}`;
       }
 
       const allowedUpdates = [
@@ -327,10 +443,16 @@ class ApiKeyService {
 
       Object.assign(apiKey, updates);
 
-      apiKey.logAuditEvent("updated", userId, auditInfo.ipAddress, auditInfo.userAgent, {
-        updatedFields: Object.keys(updates),
-        changes: updates,
-      });
+      apiKey.logAuditEvent(
+        "updated",
+        userId,
+        auditInfo.ipAddress,
+        auditInfo.userAgent,
+        {
+          updatedFields: Object.keys(updates),
+          changes: updates,
+        },
+      );
 
       await apiKey.save();
 
@@ -372,12 +494,15 @@ class ApiKeyService {
       }
 
       const keyGeneration = ApiKey.generateKey();
-      
+
       // Encrypt the new key
       const encryptionResult = ApiKey.encryptExternalKey(keyGeneration.key);
 
       // Store masked key for display, encrypted key for security
-      apiKey.key = ApiKeyService._maskExternalKey(keyGeneration.key, 'internal');
+      apiKey.key = ApiKeyService._maskExternalKey(
+        keyGeneration.key,
+        "internal",
+      );
       apiKey.keyPrefix = keyGeneration.keyPrefix;
       apiKey.hashedKey = keyGeneration.hashedKey;
       apiKey.externalKeyEncrypted = encryptionResult.encrypted;
@@ -386,7 +511,12 @@ class ApiKeyService {
       apiKey.lastRegeneratedAt = new Date();
       apiKey.status = "active";
 
-      apiKey.logAuditEvent("regenerated", userId, auditInfo.ipAddress, auditInfo.userAgent);
+      apiKey.logAuditEvent(
+        "regenerated",
+        userId,
+        auditInfo.ipAddress,
+        auditInfo.userAgent,
+      );
 
       await apiKey.save();
 
@@ -410,7 +540,12 @@ class ApiKeyService {
       }
 
       apiKey.status = "revoked";
-      apiKey.logAuditEvent("revoked", userId, auditInfo.ipAddress, auditInfo.userAgent);
+      apiKey.logAuditEvent(
+        "revoked",
+        userId,
+        auditInfo.ipAddress,
+        auditInfo.userAgent,
+      );
 
       await apiKey.save();
 
@@ -479,10 +614,16 @@ class ApiKeyService {
           totalRequests: apiKey.usage.totalRequests,
           firstUsed: apiKey.usage.firstUsed,
           lastUsed: apiKey.usage.lastUsed,
-          averageRequestsPerDay: ApiKeyService._calculateAverageRequestsPerDay(apiKey),
+          averageRequestsPerDay:
+            ApiKeyService._calculateAverageRequestsPerDay(apiKey),
           errorRate: ApiKeyService._calculateErrorRate(apiKey),
         },
-        usage: ApiKeyService._getUsageData(apiKey, granularity, startDate, endDate),
+        usage: ApiKeyService._getUsageData(
+          apiKey,
+          granularity,
+          startDate,
+          endDate,
+        ),
         rateLimits: {
           current: ApiKeyService._calculateRateLimitStatus(apiKey),
           configuration: apiKey.rateLimit,
@@ -509,7 +650,9 @@ class ApiKeyService {
    * Strip sensitive fields from a key document for API responses
    */
   static _sanitizeKeyResponse(apiKeyDoc) {
-    const response = apiKeyDoc.toObject ? apiKeyDoc.toObject() : { ...apiKeyDoc };
+    const response = apiKeyDoc.toObject
+      ? apiKeyDoc.toObject()
+      : { ...apiKeyDoc };
     delete response.hashedKey;
     delete response.externalKeyEncrypted;
     delete response.encryptionIV;
@@ -522,7 +665,7 @@ class ApiKeyService {
     today.setHours(0, 0, 0, 0);
 
     const todayUsage = apiKey.usage?.dailyUsage?.find(
-      (usage) => usage.date.getTime() === today.getTime()
+      (usage) => usage.date.getTime() === today.getTime(),
     );
 
     const dailyRequests = todayUsage ? todayUsage.requests : 0;
@@ -559,15 +702,18 @@ class ApiKeyService {
     const previous = dailyUsage.slice(-14, -7);
 
     // FIXED: guard against empty arrays
-    const recentAvg = recent.length > 0
-      ? recent.reduce((sum, day) => sum + day.requests, 0) / recent.length
-      : 0;
-    const previousAvg = previous.length > 0
-      ? previous.reduce((sum, day) => sum + day.requests, 0) / previous.length
-      : 0;
+    const recentAvg =
+      recent.length > 0
+        ? recent.reduce((sum, day) => sum + day.requests, 0) / recent.length
+        : 0;
+    const previousAvg =
+      previous.length > 0
+        ? previous.reduce((sum, day) => sum + day.requests, 0) / previous.length
+        : 0;
 
     // FIXED: guard against division by zero
-    const trend = previousAvg === 0 ? 0 : ((recentAvg - previousAvg) / previousAvg) * 100;
+    const trend =
+      previousAvg === 0 ? 0 : ((recentAvg - previousAvg) / previousAvg) * 100;
 
     return {
       trend: Math.round(trend),
@@ -594,7 +740,7 @@ class ApiKeyService {
   static _calculateErrorRate(apiKey) {
     const totalErrors = (apiKey.usage?.dailyUsage || []).reduce(
       (sum, day) => sum + (day.errors || 0),
-      0
+      0,
     );
     const totalRequests = apiKey.usage?.totalRequests || 0;
 
@@ -664,8 +810,7 @@ class ApiKeyService {
     return Object.values(endpointData)
       .map((e) => ({
         ...e,
-        errorRate:
-          e.totalRequests > 0 ? (e.errors / e.totalRequests) * 100 : 0,
+        errorRate: e.totalRequests > 0 ? (e.errors / e.totalRequests) * 100 : 0,
         avgResponseTime: e.count > 0 ? e.responseTimeSum / e.count : 0,
       }))
       .sort((a, b) => b.totalRequests - a.totalRequests);
@@ -707,7 +852,10 @@ class ApiKeyService {
 
     const rule = maskingRules[provider];
     if (rule) {
-      const maskedLength = Math.max(0, apiKey.length - rule.prefix - rule.suffix);
+      const maskedLength = Math.max(
+        0,
+        apiKey.length - rule.prefix - rule.suffix,
+      );
       return `${apiKey.substring(0, rule.prefix)}${"•".repeat(maskedLength)}${apiKey.slice(-rule.suffix)}`;
     }
 

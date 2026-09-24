@@ -1,18 +1,20 @@
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
-import FHEStub from "../services/FHEStub.js";
+import { getFheService, getFheModeInfo } from "../services/fheServiceFactory.js";
 import AIService from "../services/AIStub.js";
 
 // ============================================================
 // SERVICE SINGLETONS
 // ============================================================
 
-const fheService = new FHEStub();
+// Backend resolved from ENCRYPTION_MODE: real OpenFHE WASM (BFV) when "fhe",
+// honest AES-256-GCM stub when "mock" (with automatic WASM-failure fallback).
+// Initialized lazily per request via ensureFHEInitialized.
+let fheService = null;
 const aiService = new AIService();
 
-// Initialization promises (lazy, once-per-process)
-let fheInitializationPromise = null;
+// Initialization promises (once-per-process)
 let aiInitializationPromise = null;
 
 // ============================================================
@@ -21,11 +23,9 @@ let aiInitializationPromise = null;
 
 export const ensureFHEInitialized = async (req, _res, next) => {
   try {
-    if (!fheInitializationPromise) {
-      fheInitializationPromise = fheService.initialize();
+    if (!fheService) {
+      fheService = await getFheService();
     }
-    await fheInitializationPromise;
-
     if (!fheService.isInitialized()) {
       throw new Error("FHE service not properly initialized");
     }
@@ -62,13 +62,17 @@ class FHEController {
   // GET /status — check FHE + AI service status
   // ---------------------------------------------------------
   static getStatus = asyncHandler(async (req, res) => {
+    const modeInfo = getFheModeInfo();
     return res.status(200).json(
       new ApiResponse(
         200,
         {
           fhe: {
-            initialized: fheService.isInitialized(),
-            service: "OpenFHE WebAssembly",
+            initialized: Boolean(fheService?.isInitialized?.()),
+            service: modeInfo.activeBackend || `${modeInfo.configuredMode} (pending initialization)`,
+            configuredMode: modeInfo.configuredMode,
+            realFHE: modeInfo.realFHE,
+            fallbackReason: modeInfo.fallbackReason,
           },
           ai: {
             initialized: aiService.isInitialized(),
@@ -115,6 +119,10 @@ class FHEController {
   static compute = asyncHandler(async (req, res) => {
     const { operation, inputs } = req.body;
 
+    if (!fheService) {
+      fheService = await getFheService();
+    }
+
     const result = await fheService.performHomomorphicOperation(operation, ...inputs);
 
     return res
@@ -126,12 +134,27 @@ class FHEController {
   // GET /capabilities — FHE capabilities + AI integration info
   // ---------------------------------------------------------
   static getCapabilities = asyncHandler(async (req, res) => {
+    if (!fheService) {
+      fheService = await getFheService();
+    }
+    const info = fheService.getInfo?.() || {};
+    const modeInfo = getFheModeInfo();
+
     const capabilities = {
-      encryption: ["BGV", "BFV", "CKKS"],
-      operations: ["addition", "multiplication", "rotation", "bootstrapping"],
-      features: ["leveled", "bootstrappable", "packed"],
-      backend: "OpenFHE WebAssembly",
-      version: "1.3.1",
+      encryption: info.realFHE
+        ? ["BFV"]
+        : ["AES-256-GCM (simulation)"],
+      operations: info.realFHE
+        ? ["addition", "multiplication", "rotation", "inner-product-scoring"]
+        : ["simulated (decrypts to compute)"],
+      features: info.realFHE
+        ? ["batching", "leveled", "packed"]
+        : ["simulation"],
+      backend: info.name || modeInfo.activeBackend || "uninitialized",
+      version: info.version || "unknown",
+      realFHE: Boolean(info.realFHE),
+      configuredMode: modeInfo.configuredMode,
+      fallbackReason: modeInfo.fallbackReason,
       aiIntegration: {
         available: aiService.isInitialized(),
         operations: [

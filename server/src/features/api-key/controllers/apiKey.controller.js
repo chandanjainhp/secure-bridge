@@ -85,7 +85,7 @@ class ApiKeyController {
     };
 
     // Additional validation for external keys
-    if (externalKey && provider) {
+    if (externalKey && provider && provider !== "local") {
       const validation = ApiKey.validateExternalKeyFormat(
         externalKey,
         provider,
@@ -118,6 +118,9 @@ class ApiKeyController {
       updateData.description = sanitizers.sanitizeDescription(
         updateData.description,
       );
+    }
+    if (updateData.externalKey !== undefined) {
+      updateData.externalKey = updateData.externalKey.trim();
     }
     if (updateData.ipWhitelist) {
       updateData.ipWhitelist = sanitizers.sanitizeIpList(
@@ -157,8 +160,13 @@ class ApiKeyController {
 
   // Delete API key
   static deleteApiKey = asyncHandler(async (req, res) => {
-    const result = await ApiKeyService.deleteApiKey(req.params.keyId, req.user._id);
-    return res.status(200).json(new ApiResponse(200, result, "API key deleted successfully"));
+    const result = await ApiKeyService.deleteApiKey(
+      req.params.keyId,
+      req.user._id,
+    );
+    return res
+      .status(200)
+      .json(new ApiResponse(200, result, "API key deleted successfully"));
   });
 
   // Regenerate API key

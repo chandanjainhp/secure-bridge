@@ -34,6 +34,12 @@ router.get(
   ChatController.getModels,
 );
 
+router.get(
+  "/tools",
+  verifyJWTOrApiKey("chat.access"),
+  ChatController.getTools,
+);
+
 // Development-only routes
 if (process.env.NODE_ENV === "development") {
   router.post("/create-demo-key", ChatController.createDemoKey);

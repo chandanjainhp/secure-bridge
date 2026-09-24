@@ -16,22 +16,46 @@ from functools import lru_cache
 
 
 def _parse_allowlist(raw: str | None) -> frozenset[str]:
-    """Parse a comma-separated host list into a lowercased frozenset.
+    """Parse an allowlist into a lowercased frozenset of host patterns.
 
-    Accepts plain hostnames (``api.example.com``), host:port pairs
-    (``localhost:3000`` — the port is stripped), and full URLs
-    (``https://api.example.com/path`` — the host is extracted). Whitespace and
-    empty entries are ignored.
+    Accepts either format:
+
+    * JSON array — ``["localhost", "^.*\\.googleapis\\.com$"]`` (the format
+      used by ``server/.env``)
+    * comma-separated — ``localhost,api.example.com,https://foo.com/path``
+
+    Entries may be plain hostnames, ``host:port`` pairs (port stripped), full
+    URLs (host extracted), or ``^...$`` regex patterns (kept as-is; the
+    allowlist matcher applies them to hostnames). Whitespace and empty
+    entries are ignored.
     """
+    import json
     from urllib.parse import urlparse
 
     if not raw:
         return frozenset()
 
+    tokens: list[str]
+    stripped = raw.strip()
+    if stripped.startswith("["):
+        try:
+            data = json.loads(stripped)
+            tokens = [str(item) for item in data] if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            tokens = []
+    else:
+        tokens = []
+    if not tokens:
+        tokens = [chunk.strip() for chunk in raw.split(",")]
+
     hosts: set[str] = set()
-    for chunk in raw.split(","):
-        token = chunk.strip()
+    for token in tokens:
+        token = token.strip()
         if not token:
+            continue
+        # Regex patterns are stored verbatim (they can never be a hostname).
+        if token.startswith("^"):
+            hosts.add(token.lower())
             continue
         # If it looks like a URL, extract the host; otherwise treat as a bare
         # hostname (optionally with :port).
