@@ -1,0 +1,11 @@
+$ vite
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+  - `__dirname` (vite.config.js:15:25). Use `import.meta.dirname` instead
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+Port 5173 is in use, trying another one...
+
+  VITE v8.2.1  ready in 202 ms
+
+  ➜  Local:   http://localhost:5174/
+  ➜  Network: use --host to expose
+error: script "dev" exited with code 143
